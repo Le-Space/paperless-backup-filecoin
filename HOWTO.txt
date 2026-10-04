@@ -1,0 +1,162 @@
+PAPERLESS-NGX BACKUP TO FILECOIN ONCHAIN CLOUD - STEP BY STEP
+=============================================================
+
+What you get: once a week your whole Paperless archive (documents + database),
+encrypted on your machine, stored with several independent hosters in Europe
+at the same time. Each hoster proves on chain every day that it still holds it.
+
+Time: about 30 minutes, most of it for getting USDFC.
+Cost: about USD 0.12 per hoster per month plus USD 2.50 per TiB.
+
+
+1. INSTALL
+----------
+
+    git clone https://github.com/Le-Space/paperless-backup-filecoin.git
+    cd paperless-backup-filecoin
+    npm install
+    cp config.example.json config.json
+
+The script expects to sit next to your docker-compose.yml (one folder below
+the Paperless folder). Elsewhere, set PAPERLESS_DIR to the Paperless folder.
+If your Paperless service is not called "webserver", set PAPERLESS_SERVICE.
+
+
+2. CHOOSE REGION AND NUMBER OF COPIES
+-------------------------------------
+
+Edit config.json:
+
+    "regions": "EUROPE",    EU, EEA, EUROPE (EEA + UK + CH), or ["FR","PL","DE"]
+    "copies": 3,            how many hosters hold a copy
+    "providerIds": [],      or name them yourself, e.g. [36, 37, 1]
+
+See who is available and who would be chosen:
+
+    node backup.mjs providers
+
+Columns: id | chosen | inside your region | endorsed/approved | active | location | name
+The location is what the hoster declares itself; it is not verified.
+
+
+3. CREATE THE ENCRYPTION KEY
+----------------------------
+
+    node backup.mjs init-key
+
+macOS: the key goes into the keychain. Linux: first set where it goes, e.g.
+
+    export AGE_IDENTITY_FILE=$HOME/.config/paperless-backup/age-identity.txt
+
+IMPORTANT: keep a second copy of this key outside the machine (password
+manager, paper). Without it no backup can be read. On macOS print it with:
+
+    security find-generic-password -s paperless-backup-age-identity -a "$USER" -w
+
+
+4. DRY RUN (NOTHING IS UPLOADED)
+--------------------------------
+
+    node backup.mjs plan
+
+This exports Paperless, encrypts the export, checks that the key decrypts it,
+and prints size, chosen hosters and the monthly estimate.
+
+
+5. WALLET AND MONEY
+-------------------
+
+You need a Filecoin wallet (any EVM wallet works, e.g. MetaMask with the
+Filecoin network added) holding:
+  - some USDFC, the dollar stablecoin used for storage (5-10 USDFC last long
+    for a small archive), and
+  - a little FIL for transaction fees.
+There is no card payment. Buy FIL at an exchange, send it to your wallet,
+swap part of it to USDFC.
+
+Store the wallet's private key for the script.
+macOS (hidden prompt):
+
+    security add-generic-password -s paperless-backup-filecoin-wallet -a "$USER" -w
+
+Linux: put it in a file only you can read and set WALLET_KEY_FILE to it.
+
+Use a wallet that holds only what the backup needs.
+
+Then:
+
+    node backup.mjs status      balances and whether the account is ready
+    node backup.mjs fund 3      deposit for about three months of runway
+
+
+6. FIRST BACKUP
+---------------
+
+    node backup.mjs run
+    node backup.mjs verify
+    node backup.mjs list
+
+
+7. EVERY WEEK, AUTOMATICALLY
+----------------------------
+
+macOS (launchd), Sunday 03:30 - save as
+~/Library/LaunchAgents/paperless-backup-filecoin.plist, adjust the paths,
+then: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/paperless-backup-filecoin.plist
+
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict>
+      <key>Label</key><string>paperless-backup-filecoin</string>
+      <key>ProgramArguments</key><array>
+        <string>/bin/sh</string><string>-c</string>
+        <string>node backup.mjs run &amp;&amp; node backup.mjs verify</string>
+      </array>
+      <key>WorkingDirectory</key><string>/path/to/paperless-backup-filecoin</string>
+      <key>EnvironmentVariables</key><dict>
+        <key>PATH</key><string>/path/to/node/bin:/usr/local/bin:/usr/bin:/bin</string>
+      </dict>
+      <key>StartCalendarInterval</key><dict>
+        <key>Weekday</key><integer>0</integer>
+        <key>Hour</key><integer>3</integer>
+        <key>Minute</key><integer>30</integer>
+      </dict>
+      <key>StandardOutPath</key><string>/path/to/paperless-backup-filecoin/backup.log</string>
+      <key>StandardErrorPath</key><string>/path/to/paperless-backup-filecoin/backup.log</string>
+    </dict></plist>
+
+Linux (cron), Sunday 03:30:
+
+    30 3 * * 0  cd /path/to/paperless-backup-filecoin && export WALLET_KEY_FILE=... AGE_IDENTITY_FILE=... && (node backup.mjs run && node backup.mjs verify) >> backup.log 2>&1
+
+Clean up old backups now and then (irreversible; the newest complete one stays):
+
+    node backup.mjs prune          shows what would go
+    node backup.mjs prune --yes    deletes it
+
+
+8. RESTORE
+----------
+
+On the same machine:
+
+    node backup.mjs restore <pieceCid>
+
+On a new machine: bring ledger.json and the age key, then
+
+    AGE_IDENTITY_FILE=key.txt node backup.mjs restore <pieceCid>
+
+Without a wallet the script downloads from the hosters' public piece URLs.
+Unzip the result and import it into an empty Paperless:
+
+    docker compose exec webserver document_importer ../export/<unzipped-folder>
+
+
+9. GOOD TO KNOW
+---------------
+
+- Too few hosters in your region? The backup stops instead of storing
+  elsewhere. Widen "regions" or lower "copies".
+- A hoster dropped from the approved list? Same: the run stops and says which.
+- Keep at least one more copy elsewhere (NAS, object storage with object lock).
+  This is one leg of a 3-2-1 backup, not all of it.

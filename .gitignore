@@ -1,0 +1,7 @@
+node_modules/
+config.json
+ledger.json
+backup.log
+*.zip
+*.age
+age-identity*.txt

@@ -1,0 +1,31 @@
+{
+  "name": "paperless-backup-filecoin",
+  "version": "0.1.0",
+  "description": "Encrypted Paperless backup to Filecoin Onchain Cloud",
+  "scripts": {
+    "backup": "node backup.mjs run"
+  },
+  "keywords": [
+    "paperless-ngx",
+    "backup",
+    "filecoin",
+    "age",
+    "decentralized"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@filoz/synapse-core": "^0.10.0",
+    "@filoz/synapse-sdk": "^2.0.2",
+    "age-encryption": "^0.3.1",
+    "viem": "^2.57.2"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Le-Space/paperless-backup-filecoin.git"
+  }
+}

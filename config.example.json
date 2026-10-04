@@ -1,0 +1,9 @@
+{
+  "network": "mainnet",
+  "regions": "EUROPE",
+  "copies": 3,
+  "providerIds": [],
+  "keepWeeks": 12,
+  "datasetMetadata": { "app": "paperless-backup" },
+  "ageRecipient": null
+}
