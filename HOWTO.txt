@@ -183,7 +183,8 @@ keychain, nothing printed:
 
     node backup.mjs mail-from-paperless        or: ... "<account name>"
     node backup.mjs mail-check                 log in, send nothing
-    node backup.mjs mail-test                  send one test report
+    node backup.mjs mail-test [--warning]      send one test report (--warning: as if
+                                               the deposit lasted only 12 more days)
     node backup.mjs mail-preview               print the report, a low-funds and a
                                                failure example; send nothing
 

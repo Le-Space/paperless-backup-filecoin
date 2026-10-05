@@ -142,6 +142,7 @@ oder die Zugangsdaten des Mail-Kontos aus Paperless übernehmen:
     node backup.mjs mail-from-paperless
     node backup.mjs mail-check        Anmeldung prüfen, nichts senden
     node backup.mjs mail-test         eine Testmail schicken
+    node backup.mjs mail-test --warning   Testmail mit Warnung "Guthaben knapp"
     node backup.mjs mail-preview      Bericht ansehen, ohne zu senden
 
 Bericht auf Deutsch: in config.json "mail": { …, "language": "de" }.

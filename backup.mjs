@@ -19,7 +19,7 @@
 //   node backup.mjs daily           once a day: back up if Paperless changed, verify, prune, mail
 //   node backup.mjs mail-from-paperless [account name]   take SMTP login from a Paperless mail account
 //   node backup.mjs mail-check      log in to the SMTP server, send nothing
-//   node backup.mjs mail-test       send one test report
+//   node backup.mjs mail-test [--warning]   send one test report (--warning: as if funds ran low)
 
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -562,10 +562,12 @@ async function mailCheck() {
   log(`SMTP login to ${config.mail.host}:${config.mail.port ?? 465} as ${config.mail.user} works; reports go to ${config.mail.to}`)
 }
 
-async function mailTest() {
-  const report = { kind: 'test', lastUpload: readLedger().filter((e) => e.complete && !e.deleted).at(-1), account: await accountSummary() }
+// --warning simulates a deposit that lasts 12 more days, to see the warning mail.
+async function mailTest(warning) {
+  const account = await accountSummary()
+  const report = { kind: 'test', lastUpload: readLedger().filter((e) => e.complete && !e.deleted).at(-1), account: warning ? { ...account, runwayDays: 12 } : account }
   const mail = renderReport(report)
-  await sendMail(mail.subject, mail.text, mail)
+  await sendMail(`${warning ? '[TEST] ' : ''}${mail.subject}`, mail.text, mail)
 }
 
 // Prints the test report, and the same with simulated low funds and a failure; sends nothing.
@@ -749,7 +751,7 @@ const commands = {
   daily,
   'mail-from-paperless': () => mailFromPaperless(args[0]),
   'mail-check': mailCheck,
-  'mail-test': mailTest,
+  'mail-test': () => mailTest(args.includes('--warning')),
   'mail-preview': mailPreview,
   restore: () => restore(args[0], args[1]),
   prune: () => prune(args.includes('--yes')),
