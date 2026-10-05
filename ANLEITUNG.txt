@@ -11,6 +11,7 @@ Kosten: etwa 0,12 $ pro Hoster und Monat plus 2,50 $ pro TiB.
 Ein Archiv von 0,6 GiB bei drei Hostern: rund 0,37 $ im Monat.
 
 Ausführlich (Englisch): HOWTO.txt
+Verschlüsselung, Schlüssel und was öffentlich sichtbar bleibt: SECURITY.md
 
 
 1. INSTALLIEREN

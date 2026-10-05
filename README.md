@@ -6,7 +6,7 @@ Every day the script checks Paperless for changes, exports it (documents and dat
 
 - **Decentralised, not one cloud:** each copy sits with a different provider, under its own contract and its own proof. No single company can lose or lock away your archive.
 - **Region and copies are yours to set:** `"regions": "EU"` (or `"EEA"`, `"EUROPE"`, or country codes) and `"copies": 3`, or name the providers yourself.
-- **Encrypted before it leaves:** [age](https://age-encryption.org) encryption on your machine. Pieces on Filecoin are publicly retrievable, so the providers only ever see ciphertext.
+- **Encrypted before it leaves:** [age](https://age-encryption.org) encryption on your machine, with your own key. Pieces on Filecoin are publicly retrievable, so the providers only ever see ciphertext — details in [SECURITY.md](SECURITY.md).
 - **Cheap:** about $0.12 per provider per month plus $2.50 per TiB. A 0.6 GiB archive on three providers costs about $0.36 a month.
 - **Checkable:** `verify` asks the chain whether every copy is still in place.
 
@@ -53,7 +53,7 @@ Try it yourself for free: [HOWTO.txt](HOWTO.txt), step 5. What every command pri
 - Node.js 22+
 - A Filecoin wallet with a few USDFC (storage) and a little FIL (gas). There is no card payment; FIL can be bought at an exchange and swapped for USDFC.
 
-Step-by-step setup: [HOWTO.txt](HOWTO.txt). Auf Deutsch: [ANLEITUNG.txt](ANLEITUNG.txt).
+Step-by-step setup: [HOWTO.txt](HOWTO.txt). Auf Deutsch: [ANLEITUNG.txt](ANLEITUNG.txt). How the encryption works, where the keys live and what stays public: [SECURITY.md](SECURITY.md).
 
 ## Commands
 
