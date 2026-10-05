@@ -8,3 +8,5 @@ age-identity*.txt
 ledger.calibration.json
 config.calibration.json
 *.key
+state.json
+state.calibration.json

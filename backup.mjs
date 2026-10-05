@@ -16,6 +16,7 @@
 //   node backup.mjs verify          is every copy still in its data set?
 //   node backup.mjs restore <pieceCid> [out.zip]
 //   node backup.mjs prune --yes     delete pieces older than keepWeeks
+//   node backup.mjs daily           once a day: back up if Paperless changed, verify, prune, mail
 
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -30,6 +31,7 @@ import { getApprovedProviderIds } from '@filoz/synapse-core/warm-storage'
 import { getEndorsedProviderIds } from '@filoz/synapse-core/endorsements'
 import { createPublicClient, http } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
+import nodemailer from 'nodemailer'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PAPERLESS = process.env.PAPERLESS_DIR ?? join(HERE, '..')
@@ -39,6 +41,7 @@ const CONFIG_PATH = process.env.BACKUP_CONFIG ?? join(HERE, 'config.json')
 const KEYCHAIN = {
   wallet: 'paperless-backup-filecoin-wallet',
   identity: 'paperless-backup-age-identity',
+  smtp: 'paperless-backup-smtp',
 }
 const MAX_UPLOAD = 68_182_605_824 // 64 GiB padded, the PDP limit
 const EU = ['AT', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FI', 'FR', 'DE', 'GR', 'HU', 'IE', 'IT', 'LV', 'LT', 'LU', 'MT', 'NL', 'PL', 'PT', 'RO', 'SK', 'SI', 'ES', 'SE']
@@ -54,14 +57,17 @@ const config = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
 const chain = config.network === 'calibration' ? calibration : mainnet
 // Testnet backups get their own ledger, so they never mix with real ones.
 const LEDGER_PATH = join(HERE, config.network === 'calibration' ? 'ledger.calibration.json' : 'ledger.json')
+const STATE_PATH = join(HERE, config.network === 'calibration' ? 'state.calibration.json' : 'state.json')
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args)
 }
 
+// Thrown, not exiting, so that `daily` can still report a failure by mail.
+class Failure extends Error {}
+
 function fail(message) {
-  console.error(`error: ${message}`)
-  process.exit(1)
+  throw new Failure(message)
 }
 
 // --- secrets ----------------------------------------------------------------
@@ -325,7 +331,7 @@ async function uploadWithRetry(s, chosen, bytes) {
   throw lastError
 }
 
-async function run() {
+async function runBackup() {
   const chosen = await resolveProviders()
   const s = synapse()
   const backup = await encryptedExport()
@@ -349,7 +355,7 @@ async function run() {
   })
   writeLedger([...readLedger(), entry])
   log(`piece ${entry.pieceCid}: ${result.copies.length}/${result.requestedCopies} copies${result.complete ? '' : ' (INCOMPLETE)'}`)
-  if (!result.complete) process.exit(2)
+  return entry
 }
 
 function list() {
@@ -375,7 +381,7 @@ async function verify() {
       log(`${ok ? 'ok     ' : 'MISSING'} data set ${dataSetId} (provider ${ctx.provider?.id ?? '?'}) ${cid}`)
     }
   }
-  if (missing) process.exit(2)
+  return missing
 }
 
 async function restore(pieceCid, out) {
@@ -409,10 +415,16 @@ async function prune(yes) {
   const cutoff = Date.now() - config.keepWeeks * 7 * DAY
   const ledger = readLedger()
   const old = ledger.filter((e) => !e.deleted && Date.parse(e.date) < cutoff)
-  if (!old.length) return log('nothing older than', config.keepWeeks, 'weeks')
+  if (!old.length) {
+    log('nothing older than', config.keepWeeks, 'weeks')
+    return []
+  }
   if (ledger.filter((e) => !e.deleted && e.complete).length - old.length < 1) fail('refusing to delete: no complete newer backup would remain')
   for (const e of old) log(`${yes ? 'deleting' : 'would delete'} ${e.date.slice(0, 10)} ${e.pieceCid}`)
-  if (!yes) return log('pass --yes to delete (irreversible)')
+  if (!yes) {
+    log('pass --yes to delete (irreversible)')
+    return []
+  }
   const s = synapse()
   for (const e of old) {
     for (const c of e.copies) {
@@ -421,6 +433,135 @@ async function prune(yes) {
     }
     e.deleted = true
     writeLedger(ledger)
+  }
+  return old
+}
+
+// --- daily ------------------------------------------------------------------
+
+function readState() {
+  return existsSync(STATE_PATH) ? JSON.parse(readFileSync(STATE_PATH, 'utf8')) : {}
+}
+
+function writeState(state) {
+  writeFileSync(STATE_PATH, JSON.stringify(state, null, 2) + '\n')
+}
+
+// What changes in Paperless when a document, its metadata or the labels change.
+function paperlessFingerprint() {
+  const code = [
+    'from documents.models import Document, Tag, Correspondent, DocumentType, Note',
+    'from django.db.models import Max',
+    'import json',
+    'd = Document.global_objects',
+    'print(json.dumps({',
+    '  "documents": d.filter(deleted_at__isnull=True).count(),',
+    '  "trash": d.filter(deleted_at__isnull=False).count(),',
+    '  "modified": str(d.aggregate(m=Max("modified"))["m"]),',
+    '  "notes": Note.objects.count(),',
+    '  "labels": [m.objects.count() for m in (Tag, Correspondent, DocumentType)],',
+    '  "labelIds": [m.objects.aggregate(m=Max("id"))["m"] for m in (Tag, Correspondent, DocumentType)],',
+    '}))',
+  ].join('\n')
+  const out = execFileSync('docker', ['compose', 'exec', '-T', '-u', 'paperless', PAPERLESS_SERVICE, 'python3', 'manage.py', 'shell', '-c', code], {
+    cwd: PAPERLESS,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  })
+  const line = out.trim().split('\n').reverse().find((l) => l.startsWith('{'))
+  if (!line) fail('could not read the Paperless fingerprint (is Docker running?)')
+  return line
+}
+
+// The most recent daily start time (e.g. 03:30) that has already passed.
+function lastDueTime(now = new Date()) {
+  const [h, m] = (config.daily?.time ?? '03:30').split(':').map(Number)
+  const due = new Date(now)
+  due.setHours(h, m, 0, 0)
+  if (due > now) due.setDate(due.getDate() - 1)
+  return due
+}
+
+async function accountSummary() {
+  const s = synapse()
+  const fil = await s.payments.walletBalance({ token: TOKENS.FIL })
+  const usdfc = await s.payments.walletBalance({ token: TOKENS.USDFC })
+  const info = await s.payments.accountInfo({ token: TOKENS.USDFC })
+  const days = info.lockupRate > 0n ? Number((info.availableFunds / info.lockupRate) * 30n) / 86_400 : null
+  return {
+    fil: formatUnits(fil),
+    usdfc: formatUnits(usdfc),
+    deposit: formatUnits(info.funds),
+    available: formatUnits(info.availableFunds),
+    runwayDays: days === null ? null : Math.floor(days),
+  }
+}
+
+function smtpPassword() {
+  const fromFile = process.env.SMTP_PASSWORD_FILE
+  return fromFile ? readFileSync(fromFile, 'utf8').trim() : keychainRead(KEYCHAIN.smtp)
+}
+
+async function sendMail(subject, text) {
+  const m = config.mail
+  if (!m?.to) return log('no mail configured; skipping notification')
+  const pass = smtpPassword()
+  if (!pass) return log(`no SMTP password (keychain ${KEYCHAIN.smtp} or SMTP_PASSWORD_FILE); skipping notification`)
+  const transport = nodemailer.createTransport({ host: m.host, port: m.port ?? 465, secure: (m.port ?? 465) === 465, auth: { user: m.user, pass } })
+  await transport.sendMail({ from: m.from ?? m.user, to: m.to, subject, text })
+  log(`mail sent to ${m.to}: ${subject}`)
+}
+
+// Started at the daily time and every hour after (launchd): the first start
+// after the due time does the work, later ones exit quietly. A machine that
+// was off at 03:30 therefore catches up within the hour after it is back.
+async function daily() {
+  const state = readState()
+  const due = lastDueTime()
+  if (state.lastDaily && Date.parse(state.lastDaily) >= due.getTime()) return
+  const lines = []
+  const note = (line) => {
+    lines.push(line)
+    log(line)
+  }
+  try {
+    const fingerprint = paperlessFingerprint()
+    const lastUpload = readLedger().filter((e) => e.complete && !e.deleted).at(-1)
+    const stale = !lastUpload || Date.now() - Date.parse(lastUpload.date) > (config.daily?.fullEveryDays ?? 7) * DAY
+    let subject
+    if (fingerprint === state.lastFingerprint && !stale) {
+      note(`No change in Paperless since the backup of ${lastUpload.date.slice(0, 16).replace('T', ' ')} UTC; nothing uploaded.`)
+      subject = 'Paperless backup: no change'
+    } else {
+      const entry = await runBackup()
+      note(`Uploaded ${(entry.size / 2 ** 20).toFixed(0)} MiB, ${entry.copies.length}/${entry.requestedCopies} copies: ${entry.copies.map((c) => `provider ${c.providerId} (${(c.location ?? '').replace(/;.*$/, '')})`).join(', ')}.`)
+      note(`Piece ${entry.pieceCid}`)
+      const missing = await verify()
+      note(missing ? `Verify: ${missing} copy/copies MISSING.` : 'Verify: every copy is in its data set.')
+      if (config.daily?.prune) {
+        const removed = await prune(true)
+        if (removed.length) note(`Pruned ${removed.length} backup(s) older than ${config.keepWeeks} weeks.`)
+      }
+      subject = entry.complete && !missing ? 'Paperless backup: done' : 'Paperless backup: INCOMPLETE'
+      if (subject.endsWith('INCOMPLETE')) process.exitCode = 2
+    }
+    const acc = await accountSummary()
+    note(`Wallet ${acc.fil} FIL, ${acc.usdfc} USDFC; Filecoin Pay ${acc.available} USDFC available${acc.runwayDays === null ? '' : `, about ${acc.runwayDays} days of runway`}.`)
+    if (acc.runwayDays !== null && acc.runwayDays < (config.daily?.warnRunwayDays ?? 30)) {
+      note('Runway is short: top up with node backup.mjs fund, or the providers may end the storage.')
+      subject += ' (top up soon)'
+    }
+    writeState({ ...state, lastDaily: new Date().toISOString(), lastFingerprint: fingerprint })
+    await sendMail(subject, lines.join('\n'))
+  } catch (err) {
+    note(`FAILED: ${err.shortMessage ?? err.message}`)
+    // Retried every hour until it works; mail about it once a day.
+    const today = new Date().toISOString().slice(0, 10)
+    if (state.lastFailureMail !== today) {
+      writeState({ ...state, lastFailureMail: today })
+      await sendMail('Paperless backup: FAILED', lines.join('\n') + '\n\nIt will be retried every hour.').catch((e) => log(`mail failed: ${e.message}`))
+    }
+    process.exitCode = 1
   }
 }
 
@@ -431,11 +572,21 @@ const commands = {
   status,
   fund: () => fund(Number(args[0] ?? 3)),
   plan,
-  run,
+  run: async () => {
+    if (!(await runBackup()).complete) process.exitCode = 2
+  },
   list,
-  verify,
+  verify: async () => {
+    if (await verify()) process.exitCode = 2
+  },
+  daily,
   restore: () => restore(args[0], args[1]),
   prune: () => prune(args.includes('--yes')),
 }
-if (!commands[command]) fail(`unknown command. One of: ${Object.keys(commands).join(', ')}`)
-await commands[command]()
+try {
+  if (!commands[command]) fail(`unknown command. One of: ${Object.keys(commands).join(', ')}`)
+  await commands[command]()
+} catch (err) {
+  console.error(`error: ${err instanceof Failure ? err.message : (err.stack ?? err.message)}`)
+  process.exit(1)
+}

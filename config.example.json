@@ -4,6 +4,21 @@
   "copies": 3,
   "providerIds": [],
   "keepWeeks": 12,
-  "datasetMetadata": { "app": "paperless-backup" },
-  "ageRecipient": null
+  "datasetMetadata": {
+    "app": "paperless-backup"
+  },
+  "ageRecipient": null,
+  "daily": {
+    "time": "03:30",
+    "fullEveryDays": 7,
+    "prune": true,
+    "warnRunwayDays": 30
+  },
+  "mail": {
+    "host": "smtp.example.com",
+    "port": 465,
+    "user": "backup@example.com",
+    "from": "backup@example.com",
+    "to": "you@example.com"
+  }
 }

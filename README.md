@@ -2,7 +2,7 @@
 
 **An encrypted off-site backup for [Paperless-ngx](https://docs.paperless-ngx.com), stored on several independent hosters in Europe at the same time.**
 
-Every week the script exports Paperless (documents and database), encrypts the export on your machine, and stores it with three storage providers on [Filecoin Onchain Cloud](https://docs.filecoin.cloud) — for example one in France, one in Poland and one in the UK, run by different operators. You choose the region and the number of copies; each provider proves on chain, every day, that it still holds your copy.
+Every day the script checks Paperless for changes, exports it (documents and database), encrypts the export on your machine, and stores it with three storage providers on [Filecoin Onchain Cloud](https://docs.filecoin.cloud) — for example one in France, one in Poland and one in the UK, run by different operators. You choose the region and the number of copies; each provider proves on chain, every day, that it still holds your copy.
 
 - **Decentralised, not one cloud:** each copy sits with a different provider, under its own contract and its own proof. No single company can lose or lock away your archive.
 - **Region and copies are yours to set:** `"regions": "EU"` (or `"EEA"`, `"EUROPE"`, or country codes) and `"copies": 3`, or name the providers yourself.
@@ -10,7 +10,7 @@ Every week the script exports Paperless (documents and database), encrypts the e
 - **Cheap:** about $0.12 per provider per month plus $2.50 per TiB. A 0.6 GiB archive on three providers costs about $0.36 a month.
 - **Checkable:** `verify` asks the chain whether every copy is still in place.
 
-> Status: new (October 2026). The full round — fund, upload, verify, restore — has been run on the Filecoin Calibration testnet against a real Paperless archive (see [Tested on the testnet](#tested-on-the-testnet)). Mainnet runs the same code with real USDFC. Feedback and issues welcome.
+> Status: new (October 2026). Running daily on mainnet since 2026-10-05: 603 MiB, 3/3 copies in France, Poland and the UK, verified. The full round including restore was first run on the Calibration testnet (see [Tested on the testnet](#tested-on-the-testnet)). Feedback and issues welcome.
 
 ## How it works
 
@@ -69,6 +69,7 @@ Step-by-step setup: [HOWTO.txt](HOWTO.txt).
 | `node backup.mjs list` | stored backups |
 | `node backup.mjs restore <pieceCid> [out.zip]` | download, check, decrypt |
 | `node backup.mjs prune --yes` | delete backups older than `keepWeeks` (the newest complete one always stays) |
+| `node backup.mjs daily` | once a day: back up if Paperless changed, verify, prune, mail a report; catches up if the machine was off |
 
 ## Configuration (`config.json`)
 
@@ -78,16 +79,18 @@ Step-by-step setup: [HOWTO.txt](HOWTO.txt).
 | `copies` | number of providers when `providerIds` is empty |
 | `providerIds` | explicit provider ids; still checked against `regions` |
 | `keepWeeks` | how long `prune` keeps backups |
+| `daily` | `time` (when the day's run is due), `fullEveryDays` (upload even without changes), `prune`, `warnRunwayDays` |
+| `mail` | SMTP `host`, `port`, `user`, `from`, `to` for the daily report; password in the keychain (`paperless-backup-smtp`) or `SMTP_PASSWORD_FILE` |
 | `network` | `mainnet` or `calibration` (testnet) |
 
-Environment: `PAPERLESS_DIR` (default: the parent folder), `PAPERLESS_SERVICE` (default `webserver`), `BACKUP_CONFIG`, `WALLET_KEY_FILE`, `AGE_IDENTITY_FILE`.
+Environment: `PAPERLESS_DIR` (default: the parent folder), `PAPERLESS_SERVICE` (default `webserver`), `BACKUP_CONFIG`, `WALLET_KEY_FILE`, `AGE_IDENTITY_FILE`, `SMTP_PASSWORD_FILE`.
 
 ## Limits — read before relying on it
 
 - **Locations are self-declared.** Each provider states its location in the on-chain registry; nobody verifies it.
 - **Few approved providers so far.** In October 2026 there were 6 approved providers worldwide, 4 of them in Europe from 2 operators. `node backup.mjs providers` shows the current list.
 - **No object lock.** You (or anyone with the wallet key) can delete pieces. For immutable retention, keep an additional copy on storage with object lock.
-- **Full upload each run.** No deduplication; fine for archives of a few GiB.
+- **Full upload when something changed.** `daily` skips days without changes, but an upload is always the whole export (no deduplication); fine for archives of a few GiB.
 - **Lose the age identity, lose the backup.** Keep a second copy of it off the machine.
 - **Keep the clock right.** Deposits are signed with an expiry; a clock that is off by an hour makes them fail.
 - **Pay as you go.** Storage runs on a 30-day prepaid lockup; an empty deposit ends the storage deals. `status` shows the runway.

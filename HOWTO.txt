@@ -149,39 +149,67 @@ Then:
     node backup.mjs list
 
 
-8. EVERY WEEK, AUTOMATICALLY
-----------------------------
+8. EVERY DAY, AUTOMATICALLY - ONLY WHEN SOMETHING CHANGED
+---------------------------------------------------------
 
-macOS (launchd), Sunday 03:30 - save as
-~/Library/LaunchAgents/paperless-backup-filecoin.plist, adjust the paths,
-then: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/paperless-backup-filecoin.plist
+    node backup.mjs daily
+
+does, at most once a day:
+  1. asks Paperless whether documents, notes or labels changed since the last
+     backup (no change and the last full upload is less than a week old:
+     nothing is uploaded);
+  2. otherwise run + verify, then prune (if "daily.prune" is true);
+  3. mails a short report: what happened, copies, wallet, and how many days
+     the Filecoin Pay deposit lasts (warns below "daily.warnRunwayDays").
+Started again the same day, it exits quietly. A failure is retried on the
+next start and mailed once a day.
+
+Settings in config.json:
+
+    "daily": { "time": "03:30", "fullEveryDays": 7, "prune": true, "warnRunwayDays": 30 },
+    "mail":  { "host": "smtp.example.com", "port": 465, "user": "backup@example.com",
+               "from": "backup@example.com", "to": "you@example.com" }
+
+The SMTP password, macOS (hidden prompt):
+
+    security add-generic-password -s paperless-backup-smtp -a "$USER" -w
+
+Linux: a file only you can read, named by SMTP_PASSWORD_FILE. Without
+"mail" or a password the report only goes to backup.log.
+
+macOS (launchd): start at 03:30, every hour, and at login. The first start
+after 03:30 does the work, so a Mac that was off at night catches up within
+the hour after it is on. Save as
+~/Library/LaunchAgents/paperless-backup-filecoin.plist, adjust the paths, then:
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/paperless-backup-filecoin.plist
 
     <?xml version="1.0" encoding="UTF-8"?>
     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
     <plist version="1.0"><dict>
       <key>Label</key><string>paperless-backup-filecoin</string>
       <key>ProgramArguments</key><array>
-        <string>/bin/sh</string><string>-c</string>
-        <string>node backup.mjs run &amp;&amp; node backup.mjs verify</string>
+        <string>/bin/sh</string><string>-c</string><string>node backup.mjs daily</string>
       </array>
       <key>WorkingDirectory</key><string>/path/to/paperless-backup-filecoin</string>
       <key>EnvironmentVariables</key><dict>
         <key>PATH</key><string>/path/to/node/bin:/usr/local/bin:/usr/bin:/bin</string>
       </dict>
       <key>StartCalendarInterval</key><dict>
-        <key>Weekday</key><integer>0</integer>
-        <key>Hour</key><integer>3</integer>
-        <key>Minute</key><integer>30</integer>
+        <key>Hour</key><integer>3</integer><key>Minute</key><integer>30</integer>
       </dict>
+      <key>StartInterval</key><integer>3600</integer>
+      <key>RunAtLoad</key><true/>
       <key>StandardOutPath</key><string>/path/to/paperless-backup-filecoin/backup.log</string>
       <key>StandardErrorPath</key><string>/path/to/paperless-backup-filecoin/backup.log</string>
     </dict></plist>
 
-Linux (cron), Sunday 03:30:
+Docker must be running; until it is, each hourly start fails and retries.
 
-    30 3 * * 0  cd /path/to/paperless-backup-filecoin && export WALLET_KEY_FILE=... AGE_IDENTITY_FILE=... && (node backup.mjs run && node backup.mjs verify) >> backup.log 2>&1
+Linux (cron), every hour (the script itself decides when the day's run is due):
 
-Clean up old backups now and then (irreversible; the newest complete one stays):
+    0 * * * *  cd /path/to/paperless-backup-filecoin && export WALLET_KEY_FILE=... AGE_IDENTITY_FILE=... SMTP_PASSWORD_FILE=... && node backup.mjs daily >> backup.log 2>&1
+
+Cleaning up by hand (irreversible; the newest complete backup always stays):
 
     node backup.mjs prune          shows what would go
     node backup.mjs prune --yes    deletes it
@@ -268,9 +296,9 @@ status - after funding:
 run - export, encrypt, upload (minutes, depending on size and uplink):
 
     $ node backup.mjs run
-    2026-10-05T06:38:29.890Z exporting Paperless …
-    2026-10-05T06:39:42.993Z uploading 631848030 bytes to providers 36, 37, 1 (primary 36) …
-    2026-10-05T06:50:34.691Z piece bafkzcib…: 3/3 copies
+    2026-10-05T10:13:01.402Z exporting Paperless …
+    2026-10-05T10:14:46.855Z uploading 631848030 bytes to providers 36, 37, 1 (primary 36) …
+    2026-10-05T10:24:03.413Z piece bafkzcib…: 3/3 copies
 
   If a provider does not answer, you see a retry with the next one first:
     … upload with primary 36 failed: Failed to store piece on service provider 36 (…)
@@ -279,14 +307,20 @@ run - export, encrypt, upload (minutes, depending on size and uplink):
 verify - every copy in its data set:
 
     $ node backup.mjs verify
-    2026-10-05T06:50:51.792Z ok      data set 41709 (provider 36) bafkzcib…
-    2026-10-05T06:50:52.208Z ok      data set 41710 (provider 37) bafkzcib…
-    2026-10-05T06:50:52.608Z ok      data set 41711 (provider 1) bafkzcib…
+    2026-10-05T10:24:29.563Z ok      data set 1695 (provider 36) bafkzcib…
+    2026-10-05T10:24:30.304Z ok      data set 1694 (provider 37) bafkzcib…
+    2026-10-05T10:24:30.977Z ok      data set 1696 (provider 1) bafkzcib…
 
 list:
 
     $ node backup.mjs list
     2026-10-05 | complete | bafkzcib… | 603 MiB | 36@C=FR 37@C=PL 1@C=GB
+
+daily - a day without changes (the mail carries the same lines):
+
+    $ node backup.mjs daily
+    2026-10-05T10:25:03.271Z No change in Paperless since the backup of 2026-10-05 10:24 UTC; nothing uploaded.
+    2026-10-05T10:25:05.089Z Wallet 0.99996 FIL, 7.388 USDFC; Filecoin Pay 1.134 USDFC available, about 93 days of runway.
 
 restore - downloaded, checksum checked, decrypted:
 
