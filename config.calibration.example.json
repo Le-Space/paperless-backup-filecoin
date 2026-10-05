@@ -1,0 +1,9 @@
+{
+  "network": "calibration",
+  "regions": [],
+  "copies": 2,
+  "providerIds": [],
+  "keepWeeks": 1,
+  "datasetMetadata": { "app": "paperless-backup-test" },
+  "ageRecipient": null
+}

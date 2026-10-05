@@ -10,7 +10,7 @@ Every week the script exports Paperless (documents and database), encrypts the e
 - **Cheap:** about $0.12 per provider per month plus $2.50 per TiB. A 0.6 GiB archive on three providers costs about $0.36 a month.
 - **Checkable:** `verify` asks the chain whether every copy is still in place.
 
-> Status: new (October 2026). Export, encryption, provider selection and the decryption check are tested against a real Paperless; the upload path follows the Synapse SDK documentation and needs a funded wallet to run. Feedback and issues welcome.
+> Status: new (October 2026). The full round — fund, upload, verify, restore — has been run on the Filecoin Calibration testnet against a real Paperless archive (see [Tested on the testnet](#tested-on-the-testnet)). Mainnet runs the same code with real USDFC. Feedback and issues welcome.
 
 ## How it works
 
@@ -29,6 +29,23 @@ Paperless ── document_exporter ──► zip ── age ──► one encryp
 4. `ledger.json` records the piece, its checksum and, per copy, the provider, its declared location, the data set and the piece id.
 
 Provider choice: the providers you name, or the first `copies` approved providers inside `regions` — one per operator first, then one per country. If too few qualify, the backup stops instead of storing elsewhere.
+
+## Tested on the testnet
+
+On 2026-10-05, with a Paperless archive of about 1,000 documents, on Filecoin's Calibration testnet:
+
+| Step | Result |
+|---|---|
+| `fund 1` | deposit and service approval in one transaction |
+| `run` | 603 MiB encrypted export, uploaded in 11 minutes; 2/2 copies (providers in the UK and the US), recorded on chain |
+| `verify` | the piece found in both data sets |
+| `restore` | downloaded and decrypted in under 3 minutes; SHA-256 identical to the original export, zip intact with its manifest |
+
+What it taught, now in the script:
+- A first attempt failed because the primary provider stopped answering after the upload. `run` now retries with the next chosen provider as primary — the set of providers, and so the region, stays the same.
+- The Mac's clock was an hour slow, and the deposit was refused (`EIP2612: expired deadline`): the permit had expired by chain time. Keep the system clock synced.
+
+Try it yourself for free: [HOWTO.txt](HOWTO.txt), step 5.
 
 ## Requirements
 
@@ -72,6 +89,7 @@ Environment: `PAPERLESS_DIR` (default: the parent folder), `PAPERLESS_SERVICE` (
 - **No object lock.** You (or anyone with the wallet key) can delete pieces. For immutable retention, keep an additional copy on storage with object lock.
 - **Full upload each run.** No deduplication; fine for archives of a few GiB.
 - **Lose the age identity, lose the backup.** Keep a second copy of it off the machine.
+- **Keep the clock right.** Deposits are signed with an expiry; a clock that is off by an hour makes them fail.
 - **Pay as you go.** Storage runs on a 30-day prepaid lockup; an empty deposit ends the storage deals. `status` shows the runway.
 
 ## Related

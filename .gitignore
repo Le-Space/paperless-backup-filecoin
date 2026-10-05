@@ -1,7 +1,10 @@
 node_modules/
 config.json
 ledger.json
-backup.log
+*.log
 *.zip
 *.age
 age-identity*.txt
+ledger.calibration.json
+config.calibration.json
+*.key

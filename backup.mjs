@@ -24,7 +24,7 @@ import { platform } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Decrypter, Encrypter, generateX25519Identity, identityToRecipient } from 'age-encryption'
-import { Synapse, calibration, formatUnits, mainnet } from '@filoz/synapse-sdk'
+import { Synapse, TOKENS, calibration, formatUnits, mainnet } from '@filoz/synapse-sdk'
 import { getPDPProvidersByIds } from '@filoz/synapse-core/sp-registry'
 import { getApprovedProviderIds } from '@filoz/synapse-core/warm-storage'
 import { getEndorsedProviderIds } from '@filoz/synapse-core/endorsements'
@@ -36,7 +36,6 @@ const PAPERLESS = process.env.PAPERLESS_DIR ?? join(HERE, '..')
 const PAPERLESS_SERVICE = process.env.PAPERLESS_SERVICE ?? 'webserver'
 const EXPORT_DIR = join(PAPERLESS, 'export')
 const CONFIG_PATH = process.env.BACKUP_CONFIG ?? join(HERE, 'config.json')
-const LEDGER_PATH = join(HERE, 'ledger.json')
 const KEYCHAIN = {
   wallet: 'paperless-backup-filecoin-wallet',
   identity: 'paperless-backup-age-identity',
@@ -53,6 +52,8 @@ if (!existsSync(CONFIG_PATH)) {
 }
 const config = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
 const chain = config.network === 'calibration' ? calibration : mainnet
+// Testnet backups get their own ledger, so they never mix with real ones.
+const LEDGER_PATH = join(HERE, config.network === 'calibration' ? 'ledger.calibration.json' : 'ledger.json')
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args)
@@ -263,10 +264,11 @@ async function providers() {
 
 async function status() {
   const s = synapse()
-  const wallet = await s.payments.walletBalance()
-  const deposit = await s.payments.balance()
+  const fil = await s.payments.walletBalance({ token: TOKENS.FIL })
+  const usdfc = await s.payments.walletBalance({ token: TOKENS.USDFC })
+  const deposit = await s.payments.balance({ token: TOKENS.USDFC })
   log(`network ${chain.name}, account ${s.address}`)
-  log(`USDFC in wallet ${formatUnits(wallet)}, available in Filecoin Pay ${formatUnits(deposit)}`)
+  log(`wallet: ${formatUnits(fil)} FIL, ${formatUnits(usdfc)} USDFC; available in Filecoin Pay: ${formatUnits(deposit)} USDFC`)
   const { costs, transaction } = await s.storage.prepare({ context: await chosenContexts(s), pieceSizes: [1n << 30n] })
   log(`for 1 GiB on providers ${(await resolveProviders()).map((p) => p.id).join(', ')}: ${formatUnits(costs.rates.perMonth)} USDFC per month`)
   log(transaction ? `not ready: deposit ${formatUnits(transaction.depositAmount)} USDFC needed (node backup.mjs fund)` : 'ready to upload')
@@ -303,16 +305,34 @@ async function plan() {
   log(`estimate: ~${(perCopy * chosen.length).toFixed(3)} USD per month for ${chosen.length} copies (one piece; each further kept week adds the storage part)`)
 }
 
+// The primary copy is the one this machine uploads; the others pull from it.
+// A primary that stops answering fails the whole upload, so each retry puts
+// the next chosen provider first. The set of providers never changes.
+async function uploadWithRetry(s, chosen, bytes) {
+  let lastError
+  for (let attempt = 0; attempt < chosen.length; attempt++) {
+    const order = [...chosen.slice(attempt), ...chosen.slice(0, attempt)]
+    const contexts = await s.storage.createContexts({ providerIds: order.map((p) => BigInt(p.id)), metadata: config.datasetMetadata })
+    log(`uploading ${bytes.byteLength} bytes to providers ${order.map((p) => p.id).join(', ')} (primary ${order[0].id}) …`)
+    try {
+      return await s.storage.upload(bytes, { contexts })
+    } catch (err) {
+      lastError = err
+      log(`upload with primary ${order[0].id} failed: ${err.shortMessage ?? err.message}`)
+      if (attempt + 1 < chosen.length) await new Promise((r) => setTimeout(r, 30_000))
+    }
+  }
+  throw lastError
+}
+
 async function run() {
   const chosen = await resolveProviders()
   const s = synapse()
-  const contexts = await chosenContexts(s)
   const backup = await encryptedExport()
-  const { transaction } = await s.storage.prepare({ context: contexts, pieceSizes: [BigInt(backup.sealed.byteLength)] })
+  const { transaction } = await s.storage.prepare({ context: await chosenContexts(s), pieceSizes: [BigInt(backup.sealed.byteLength)] })
   if (transaction) fail(`account not funded for this upload (needs ${formatUnits(transaction.depositAmount)} USDFC); run: node backup.mjs fund`)
 
-  log(`uploading ${backup.sealed.byteLength} bytes to providers ${chosen.map((p) => p.id).join(', ')} …`)
-  const result = await s.storage.upload(backup.sealed, { contexts })
+  const result = await uploadWithRetry(s, chosen, backup.sealed)
   const entry = jsonable({
     name: backup.name,
     date: new Date().toISOString(),

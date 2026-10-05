@@ -63,25 +63,77 @@ This exports Paperless, encrypts the export, checks that the key decrypts it,
 and prints size, chosen hosters and the monthly estimate.
 
 
-5. WALLET AND MONEY
--------------------
+5. TRY IT ON THE TESTNET FIRST (FREE)
+-------------------------------------
 
-You need a Filecoin wallet (any EVM wallet works, e.g. MetaMask with the
-Filecoin network added) holding:
-  - some USDFC, the dollar stablecoin used for storage (5-10 USDFC last long
-    for a small archive), and
-  - a little FIL for transaction fees.
-There is no card payment. Buy FIL at an exchange, send it to your wallet,
-swap part of it to USDFC.
+Filecoin's Calibration testnet works like mainnet, with free test tokens.
+A full round - fund, upload, verify, restore - costs nothing.
 
-Store the wallet's private key for the script.
+    cp config.calibration.example.json config.calibration.json
+    node backup.mjs init-key        (skip if you already did step 3)
+
+Copy "ageRecipient" from config.json into config.calibration.json.
+
+Make a throwaway testnet wallet. It is printed only as an address; the key
+goes into a file only you can read:
+
+    node -e 'import("viem/accounts").then(({generatePrivateKey,privateKeyToAccount})=>{const k=generatePrivateKey();require("fs").writeFileSync("testnet-wallet.key",k+"\n",{mode:0o600});console.log(privateKeyToAccount(k).address)})'
+
+Get test tokens for that address:
+  - tFIL (gas):     https://faucet.calibnet.chainsafe-fil.io/funds.html
+  - tUSDFC (storage): https://forest-explorer.chainsafe.dev/faucet/calibnet_usdfc
+
+Then run everything against the testnet:
+
+    export BACKUP_CONFIG=config.calibration.json WALLET_KEY_FILE=testnet-wallet.key
+    node backup.mjs providers
+    node backup.mjs status
+    node backup.mjs fund 1
+    node backup.mjs run
+    node backup.mjs verify
+    node backup.mjs list
+    node backup.mjs restore <pieceCid> restore-test.zip
+    unset BACKUP_CONFIG WALLET_KEY_FILE
+
+Testnet backups are recorded in ledger.calibration.json, apart from real
+ones. The testnet has few providers and no region choice worth the name;
+it is for checking the procedure, not for keeping data.
+
+
+6. WALLET AND MONEY (MAINNET)
+-----------------------------
+
+What the script pays with:
+  - USDFC, a dollar stablecoin on Filecoin, for storage. About 10 USDFC
+    last many months for an archive of a few GiB.
+  - A little FIL for transaction fees; about 0.5 FIL is plenty.
+There is no card payment.
+
+Getting USDFC (with FIL in a wallet such as MetaMask on the Filecoin network):
+  - SushiSwap on Filecoin: swap FIL for USDFC (pair FIL/USDFC, V3).
+    The simplest way. Watch the price impact on small pools.
+  - Squid Router (https://app.squidrouter.com): swap or bridge from other
+    chains and tokens to USDFC.
+  - The USDFC app (https://app.usdfc.net) mints USDFC against FIL collateral.
+    That is a loan: if FIL falls, the collateral can be liquidated. Not worth
+    it for a few dollars of storage.
+No FIL yet? Buy it at an exchange and withdraw it to your wallet on the
+Filecoin network.
+
+USE A SEPARATE WALLET FOR THE BACKUP. The script holds its private key, so
+whoever gets into the machine could empty that wallet. In MetaMask:
+  1. "Add account" - a new account only for the backup.
+  2. In your main account, swap FIL for 10-15 USDFC.
+  3. Send the USDFC and about 0.5 FIL to the backup account.
+  4. Give the script only the backup account's key
+     (MetaMask: account details > show private key).
+
+Store that key for the script.
 macOS (hidden prompt):
 
     security add-generic-password -s paperless-backup-filecoin-wallet -a "$USER" -w
 
 Linux: put it in a file only you can read and set WALLET_KEY_FILE to it.
-
-Use a wallet that holds only what the backup needs.
 
 Then:
 
@@ -89,15 +141,15 @@ Then:
     node backup.mjs fund 3      deposit for about three months of runway
 
 
-6. FIRST BACKUP
----------------
+7. FIRST BACKUP (MAINNET)
+-------------------------
 
     node backup.mjs run
     node backup.mjs verify
     node backup.mjs list
 
 
-7. EVERY WEEK, AUTOMATICALLY
+8. EVERY WEEK, AUTOMATICALLY
 ----------------------------
 
 macOS (launchd), Sunday 03:30 - save as
@@ -135,7 +187,7 @@ Clean up old backups now and then (irreversible; the newest complete one stays):
     node backup.mjs prune --yes    deletes it
 
 
-8. RESTORE
+9. RESTORE
 ----------
 
 On the same machine:
@@ -152,9 +204,13 @@ Unzip the result and import it into an empty Paperless:
     docker compose exec webserver document_importer ../export/<unzipped-folder>
 
 
-9. GOOD TO KNOW
----------------
+10. GOOD TO KNOW
+----------------
 
+- A hoster that stops answering during the upload: run retries with the
+  next chosen hoster as the one you upload to; the others copy from it.
+- "EIP2612: expired deadline" when funding: your computer's clock is off.
+  Switch on automatic date and time, then fund again.
 - Too few hosters in your region? The backup stops instead of storing
   elsewhere. Widen "regions" or lower "copies".
 - A hoster dropped from the approved list? Same: the run stops and says which.
