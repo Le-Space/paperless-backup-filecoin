@@ -132,9 +132,16 @@ Unter macOS per launchd um 03:30, stündlich und bei der Anmeldung starten -
 so holt ein nachts ausgeschalteter Mac das Backup nach. Vorlage: HOWTO.txt,
 Schritt 8.
 
-Mail: Abschnitt "mail" in config.json ausfüllen, SMTP-Passwort eintragen:
+Mail: Abschnitt "mail" in config.json ausfüllen (mindestens "to"), dann
+entweder das SMTP-Passwort eintragen:
 
     security add-generic-password -s paperless-backup-smtp -a "$USER" -w
+
+oder die Zugangsdaten des Mail-Kontos aus Paperless übernehmen:
+
+    node backup.mjs mail-from-paperless
+    node backup.mjs mail-check        Anmeldung prüfen, nichts senden
+    node backup.mjs mail-test         eine Testmail schicken
 
 
 8. WIEDERHERSTELLEN

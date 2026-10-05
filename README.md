@@ -69,6 +69,7 @@ Step-by-step setup: [HOWTO.txt](HOWTO.txt). Auf Deutsch: [ANLEITUNG.txt](ANLEITU
 | `node backup.mjs list` | stored backups |
 | `node backup.mjs restore <pieceCid> [out.zip]` | download, check, decrypt |
 | `node backup.mjs prune --yes` | delete backups older than `keepWeeks` (the newest complete one always stays) |
+| `node backup.mjs mail-from-paperless` / `mail-check` / `mail-test` | take the SMTP login from a Paperless mail account; check the login; send a test report |
 | `node backup.mjs daily` | once a day: back up if Paperless changed, verify, prune, mail a report; catches up if the machine was off |
 
 ## Configuration (`config.json`)

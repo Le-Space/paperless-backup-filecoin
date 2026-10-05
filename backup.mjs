@@ -17,6 +17,9 @@
 //   node backup.mjs restore <pieceCid> [out.zip]
 //   node backup.mjs prune --yes     delete pieces older than keepWeeks
 //   node backup.mjs daily           once a day: back up if Paperless changed, verify, prune, mail
+//   node backup.mjs mail-from-paperless [account name]   take SMTP login from a Paperless mail account
+//   node backup.mjs mail-check      log in to the SMTP server, send nothing
+//   node backup.mjs mail-test       send one test report
 
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -502,14 +505,71 @@ function smtpPassword() {
   return fromFile ? readFileSync(fromFile, 'utf8').trim() : keychainRead(KEYCHAIN.smtp)
 }
 
-async function sendMail(subject, text) {
+function mailTransport() {
   const m = config.mail
-  if (!m?.to) return log('no mail configured; skipping notification')
+  if (!m?.to || !m?.user) return null
   const pass = smtpPassword()
-  if (!pass) return log(`no SMTP password (keychain ${KEYCHAIN.smtp} or SMTP_PASSWORD_FILE); skipping notification`)
-  const transport = nodemailer.createTransport({ host: m.host, port: m.port ?? 465, secure: (m.port ?? 465) === 465, auth: { user: m.user, pass } })
+  if (!pass) {
+    log(`no SMTP password (keychain ${KEYCHAIN.smtp} or SMTP_PASSWORD_FILE)`)
+    return null
+  }
+  return nodemailer.createTransport({ host: m.host, port: m.port ?? 465, secure: (m.port ?? 465) === 465, auth: { user: m.user, pass } })
+}
+
+async function sendMail(subject, text) {
+  const transport = mailTransport()
+  if (!transport) return log('mail not configured; skipping notification')
+  const m = config.mail
   await transport.sendMail({ from: m.from ?? m.user, to: m.to, subject, text })
   log(`mail sent to ${m.to}: ${subject}`)
+}
+
+// Copies the login of a Paperless mail account (IMAP) for sending the report:
+// the user name into config.json, the password into the keychain. Neither is
+// printed. The daily run then mails even when Docker (and Paperless) is down.
+async function mailFromPaperless(accountName) {
+  if (platform() !== 'darwin') fail('mail-from-paperless stores into the macOS keychain; elsewhere use SMTP_PASSWORD_FILE')
+  const code = [
+    'from paperless_mail.models import MailAccount',
+    'import json',
+    `qs = MailAccount.objects.filter(name=${JSON.stringify(accountName ?? '')}) if ${JSON.stringify(accountName ?? '')} else MailAccount.objects.all()`,
+    'a = qs.order_by("id").first()',
+    'print(json.dumps({"name": a.name, "user": a.username, "pass": a.password, "host": a.imap_server, "token": a.is_token}) if a else "{}")',
+  ].join('\n')
+  const out = execFileSync('docker', ['compose', 'exec', '-T', '-u', 'paperless', PAPERLESS_SERVICE, 'python3', 'manage.py', 'shell', '-c', code], {
+    cwd: PAPERLESS,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  })
+  const account = JSON.parse(out.trim().split('\n').reverse().find((l) => l.startsWith('{')) ?? '{}')
+  if (!account.user || !account.pass) fail('no Paperless mail account with a user name and password found')
+  if (account.token) fail(`Paperless account "${account.name}" uses an OAuth token, not a password`)
+  try {
+    execFileSync('security', ['delete-generic-password', '-s', KEYCHAIN.smtp, '-a', process.env.USER], { stdio: 'ignore' })
+  } catch {}
+  execFileSync('security', ['add-generic-password', '-s', KEYCHAIN.smtp, '-a', process.env.USER, '-w', account.pass], { stdio: 'ignore' })
+  config.mail = { ...config.mail, host: config.mail?.host ?? account.host, user: account.user, from: config.mail?.from ?? account.user }
+  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + '\n')
+  log(`SMTP login taken from Paperless account "${account.name}": user written to config.json, password to the keychain (${KEYCHAIN.smtp})`)
+}
+
+async function mailCheck() {
+  const transport = mailTransport()
+  if (!transport) fail('mail not configured: config.json "mail" needs to, user; and an SMTP password')
+  await transport.verify()
+  log(`SMTP login to ${config.mail.host}:${config.mail.port ?? 465} as ${config.mail.user} works; reports go to ${config.mail.to}`)
+}
+
+async function mailTest() {
+  const acc = await accountSummary()
+  await sendMail(
+    'Paperless backup: test mail',
+    [
+      'This is a test of the daily Paperless backup report.',
+      `Last backup: ${readLedger().filter((e) => e.complete && !e.deleted).at(-1)?.date ?? 'none yet'}`,
+      `Wallet ${acc.fil} FIL, ${acc.usdfc} USDFC; Filecoin Pay ${acc.available} USDFC available${acc.runwayDays === null ? '' : `, about ${acc.runwayDays} days of runway`}.`,
+    ].join('\n'),
+  )
 }
 
 // Started at the daily time and every hour after (launchd): the first start
@@ -580,6 +640,9 @@ const commands = {
     if (await verify()) process.exitCode = 2
   },
   daily,
+  'mail-from-paperless': () => mailFromPaperless(args[0]),
+  'mail-check': mailCheck,
+  'mail-test': mailTest,
   restore: () => restore(args[0], args[1]),
   prune: () => prune(args.includes('--yes')),
 }
