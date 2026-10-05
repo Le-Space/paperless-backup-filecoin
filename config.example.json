@@ -19,6 +19,7 @@
     "port": 465,
     "user": "backup@example.com",
     "from": "backup@example.com",
-    "to": "you@example.com"
+    "to": "you@example.com",
+    "language": "en"
   }
 }

@@ -184,6 +184,14 @@ keychain, nothing printed:
     node backup.mjs mail-from-paperless        or: ... "<account name>"
     node backup.mjs mail-check                 log in, send nothing
     node backup.mjs mail-test                  send one test report
+    node backup.mjs mail-preview               print the report, a low-funds and a
+                                               failure example; send nothing
+
+The report is plain text plus HTML, in English or German ("mail.language":
+"en" or "de"). Low funds (under "daily.warnRunwayDays", or under 0.05 FIL
+for fees), failures and missing copies are sent with high priority (a "!"
+in Apple Mail and Outlook), with a warning sign in the subject and a red box
+on top that says how to top up.
 
 macOS (launchd): start at 03:30, every hour, and at login. The first start
 after 03:30 does the work, so a Mac that was off at night catches up within

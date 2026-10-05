@@ -142,6 +142,12 @@ oder die Zugangsdaten des Mail-Kontos aus Paperless übernehmen:
     node backup.mjs mail-from-paperless
     node backup.mjs mail-check        Anmeldung prüfen, nichts senden
     node backup.mjs mail-test         eine Testmail schicken
+    node backup.mjs mail-preview      Bericht ansehen, ohne zu senden
+
+Bericht auf Deutsch: in config.json "mail": { …, "language": "de" }.
+Wird das Guthaben knapp (oder fehlt FIL für Gebühren), schlägt das Backup
+fehl oder fehlen Kopien, kommt die Mail mit hoher Priorität ("!" in Apple
+Mail), ⚠️ im Betreff und einem roten Hinweis, wie man auffüllt.
 
 
 8. WIEDERHERSTELLEN

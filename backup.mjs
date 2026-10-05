@@ -492,10 +492,11 @@ async function accountSummary() {
   const info = await s.payments.accountInfo({ token: TOKENS.USDFC })
   const days = info.lockupRate > 0n ? Number((info.availableFunds / info.lockupRate) * 30n) / 86_400 : null
   return {
-    fil: formatUnits(fil),
-    usdfc: formatUnits(usdfc),
-    deposit: formatUnits(info.funds),
-    available: formatUnits(info.availableFunds),
+    address: s.address,
+    fil: Number(formatUnits(fil)),
+    usdfc: Number(formatUnits(usdfc)),
+    deposit: Number(formatUnits(info.funds)),
+    available: Number(formatUnits(info.availableFunds)),
     runwayDays: days === null ? null : Math.floor(days),
   }
 }
@@ -516,11 +517,12 @@ function mailTransport() {
   return nodemailer.createTransport({ host: m.host, port: m.port ?? 465, secure: (m.port ?? 465) === 465, auth: { user: m.user, pass } })
 }
 
-async function sendMail(subject, text) {
+async function sendMail(subject, text, { html, important = false } = {}) {
   const transport = mailTransport()
   if (!transport) return log('mail not configured; skipping notification')
   const m = config.mail
-  await transport.sendMail({ from: m.from ?? m.user, to: m.to, subject, text })
+  // priority "high" sets X-Priority 1 / Importance high: Apple Mail and Outlook show a "!".
+  await transport.sendMail({ from: m.from ?? m.user, to: m.to, subject, text, html, priority: important ? 'high' : 'normal' })
   log(`mail sent to ${m.to}: ${subject}`)
 }
 
@@ -561,15 +563,131 @@ async function mailCheck() {
 }
 
 async function mailTest() {
-  const acc = await accountSummary()
-  await sendMail(
-    'Paperless backup: test mail',
-    [
-      'This is a test of the daily Paperless backup report.',
-      `Last backup: ${readLedger().filter((e) => e.complete && !e.deleted).at(-1)?.date ?? 'none yet'}`,
-      `Wallet ${acc.fil} FIL, ${acc.usdfc} USDFC; Filecoin Pay ${acc.available} USDFC available${acc.runwayDays === null ? '' : `, about ${acc.runwayDays} days of runway`}.`,
-    ].join('\n'),
-  )
+  const report = { kind: 'test', lastUpload: readLedger().filter((e) => e.complete && !e.deleted).at(-1), account: await accountSummary() }
+  const mail = renderReport(report)
+  await sendMail(mail.subject, mail.text, mail)
+}
+
+// Prints the test report, and the same with simulated low funds and a failure; sends nothing.
+async function mailPreview() {
+  const account = await accountSummary()
+  const lastUpload = readLedger().filter((e) => e.complete && !e.deleted).at(-1)
+  const cases = [
+    { kind: 'test', lastUpload, account },
+    { kind: 'unchanged', lastUpload, account: { ...account, runwayDays: 12, fil: 0.01 } },
+    { kind: 'failed', error: 'could not read the Paperless fingerprint (is Docker running?)', account },
+  ]
+  for (const r of cases) {
+    const m = renderReport(r)
+    console.log(`--- ${m.important ? '[!] ' : ''}${m.subject}\n${m.text}\n`)
+  }
+}
+
+// --- report -----------------------------------------------------------------
+
+const TEXT = {
+  de: {
+    subject: { test: 'Paperless-Backup: Testmail', unchanged: 'Paperless-Backup: keine Änderung', done: 'Paperless-Backup: erledigt', incomplete: 'Paperless-Backup: UNVOLLSTÄNDIG', failed: 'Paperless-Backup: FEHLGESCHLAGEN' },
+    lowFunds: '⚠️ Guthaben knapp – ',
+    test: 'Das ist eine Testmail des täglichen Paperless-Backups.',
+    unchanged: (d) => `Keine Änderung in Paperless seit dem Backup vom ${d}. Es wurde nichts hochgeladen.`,
+    uploaded: (mib, n, of) => `Neues Backup: ${mib} MiB, ${n} von ${of} Kopien gespeichert.`,
+    copy: (id, country) => `Anbieter ${id} (${country})`,
+    verifyOk: 'Prüfung: Jede Kopie liegt in ihrem Datensatz.',
+    verifyMissing: (n) => `Prüfung: ${n} Kopie(n) FEHLEN.`,
+    pruned: (n, w) => `${n} Backup(s) älter als ${w} Wochen entfernt.`,
+    lastBackup: (d) => `Letztes Backup: ${d}`,
+    noBackup: 'Noch kein Backup.',
+    failed: (msg) => `Das Backup ist fehlgeschlagen: ${msg}`,
+    retry: 'Es wird jede Stunde erneut versucht; diese Mail kommt höchstens einmal am Tag.',
+    account: 'Konto',
+    wallet: (fil, usdfc) => `Wallet: ${fil} FIL, ${usdfc} USDFC`,
+    pay: (avail, days) => `Filecoin Pay: ${avail} USDFC verfügbar${days === null ? '' : `, reicht noch etwa ${days} Tage`}`,
+    warnTitle: (days) => `ACHTUNG: Das Guthaben reicht nur noch etwa ${days} Tage.`,
+    warnBody: 'Läuft es leer, beenden die Anbieter die Speicherung – die Backups gehen verloren.',
+    warnGas: 'Zu wenig FIL für Gebühren auf dem Backup-Konto.',
+    howTo: 'So füllst du auf:',
+    step1: (addr) => `1. USDFC (und bei Bedarf etwas FIL) an das Backup-Konto schicken: ${addr}`,
+    step2: '2. Im Terminal: cd ~/paperless-ngx/backup-filecoin && node backup.mjs fund 3',
+    piece: 'Piece-CID',
+  },
+  en: {
+    subject: { test: 'Paperless backup: test mail', unchanged: 'Paperless backup: no change', done: 'Paperless backup: done', incomplete: 'Paperless backup: INCOMPLETE', failed: 'Paperless backup: FAILED' },
+    lowFunds: '⚠️ Low funds – ',
+    test: 'This is a test of the daily Paperless backup report.',
+    unchanged: (d) => `No change in Paperless since the backup of ${d}. Nothing was uploaded.`,
+    uploaded: (mib, n, of) => `New backup: ${mib} MiB, ${n} of ${of} copies stored.`,
+    copy: (id, country) => `provider ${id} (${country})`,
+    verifyOk: 'Verify: every copy is in its data set.',
+    verifyMissing: (n) => `Verify: ${n} copy/copies MISSING.`,
+    pruned: (n, w) => `Removed ${n} backup(s) older than ${w} weeks.`,
+    lastBackup: (d) => `Last backup: ${d}`,
+    noBackup: 'No backup yet.',
+    failed: (msg) => `The backup failed: ${msg}`,
+    retry: 'It is retried every hour; this mail comes at most once a day.',
+    account: 'Account',
+    wallet: (fil, usdfc) => `Wallet: ${fil} FIL, ${usdfc} USDFC`,
+    pay: (avail, days) => `Filecoin Pay: ${avail} USDFC available${days === null ? '' : `, lasts about ${days} more days`}`,
+    warnTitle: (days) => `WARNING: the deposit lasts only about ${days} more days.`,
+    warnBody: 'When it runs out, the providers end the storage and the backups are lost.',
+    warnGas: 'Too little FIL for fees on the backup account.',
+    howTo: 'To top up:',
+    step1: (addr) => `1. Send USDFC (and some FIL if needed) to the backup account: ${addr}`,
+    step2: '2. In a terminal: cd ~/paperless-ngx/backup-filecoin && node backup.mjs fund 3',
+    piece: 'Piece CID',
+  },
+}
+
+const escapeHtml = (v) => String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
+
+function renderReport(r) {
+  const lang = config.mail?.language === 'de' ? 'de' : 'en'
+  const t = TEXT[lang]
+  const locale = lang === 'de' ? 'de-DE' : 'en-GB'
+  const num = (v, digits) => v.toLocaleString(locale, { minimumFractionDigits: digits, maximumFractionDigits: digits })
+  const when = (iso) => new Date(iso).toLocaleString(locale, { dateStyle: 'medium', timeStyle: 'short' })
+  const country = (loc) => /(?:^|;)C=([A-Z]{2})/i.exec(loc ?? '')?.[1] ?? '?'
+
+  const lines = []
+  if (r.kind === 'test') {
+    lines.push(t.test, r.lastUpload ? t.lastBackup(when(r.lastUpload.date)) : t.noBackup)
+  } else if (r.kind === 'unchanged') {
+    lines.push(t.unchanged(when(r.lastUpload.date)))
+  } else if (r.kind === 'failed') {
+    lines.push(t.failed(r.error), t.retry)
+  } else {
+    const e = r.entry
+    lines.push(t.uploaded(num(e.size / 2 ** 20, 0), e.copies.length, e.requestedCopies))
+    lines.push(...e.copies.map((c) => `  – ${t.copy(c.providerId, country(c.location))}`))
+    lines.push(r.missing ? t.verifyMissing(r.missing) : t.verifyOk)
+    if (r.pruned) lines.push(t.pruned(r.pruned, config.keepWeeks))
+    lines.push(`${t.piece}: ${e.pieceCid}`)
+  }
+
+  const a = r.account
+  const lowRunway = a && a.runwayDays !== null && a.runwayDays < (config.daily?.warnRunwayDays ?? 30)
+  const lowGas = a && a.fil < 0.05
+  const warning = []
+  if (lowRunway) warning.push(t.warnTitle(a.runwayDays), t.warnBody)
+  if (lowGas) warning.push(t.warnGas)
+  if (warning.length) warning.push('', t.howTo, t.step1(a.address), t.step2)
+
+  const accountLines = a ? [t.wallet(num(a.fil, 4), num(a.usdfc, 2)), t.pay(num(a.available, 2), a.runwayDays)] : []
+  const problem = r.kind === 'failed' || r.kind === 'incomplete' || r.missing > 0
+  const subject = (warning.length ? t.lowFunds : '') + t.subject[r.kind === 'done' && r.missing ? 'incomplete' : r.kind]
+
+  const text = [...(warning.length ? [...warning.map((l) => (l ? `!! ${l}` : '')), ''] : []), ...lines, '', `${t.account}:`, ...accountLines].join('\n')
+  const block = (rows) => rows.map((l) => (l ? escapeHtml(l) : '&nbsp;')).join('<br>')
+  const html = [
+    '<div style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;color:#1d1d1f">',
+    warning.length
+      ? `<div style="background:#fdecea;border-left:6px solid #d93025;padding:12px 14px;margin-bottom:16px;color:#8a1c12"><strong>⚠️ ${escapeHtml(warning[0])}</strong><br>${block(warning.slice(1))}</div>`
+      : '',
+    problem ? `<div style="border-left:6px solid #d93025;padding:4px 12px;margin-bottom:12px">${block(lines)}</div>` : `<p>${block(lines)}</p>`,
+    a ? `<p style="color:#555"><strong>${escapeHtml(t.account)}</strong><br>${block(accountLines)}</p>` : '',
+    '</div>',
+  ].join('')
+  return { subject, text, html, important: warning.length > 0 || problem }
 }
 
 // Started at the daily time and every hour after (launchd): the first start
@@ -579,47 +697,36 @@ async function daily() {
   const state = readState()
   const due = lastDueTime()
   if (state.lastDaily && Date.parse(state.lastDaily) >= due.getTime()) return
-  const lines = []
-  const note = (line) => {
-    lines.push(line)
-    log(line)
-  }
   try {
     const fingerprint = paperlessFingerprint()
     const lastUpload = readLedger().filter((e) => e.complete && !e.deleted).at(-1)
     const stale = !lastUpload || Date.now() - Date.parse(lastUpload.date) > (config.daily?.fullEveryDays ?? 7) * DAY
-    let subject
+    let report
     if (fingerprint === state.lastFingerprint && !stale) {
-      note(`No change in Paperless since the backup of ${lastUpload.date.slice(0, 16).replace('T', ' ')} UTC; nothing uploaded.`)
-      subject = 'Paperless backup: no change'
+      log(`no change in Paperless since ${lastUpload.date}; nothing uploaded`)
+      report = { kind: 'unchanged', lastUpload }
     } else {
       const entry = await runBackup()
-      note(`Uploaded ${(entry.size / 2 ** 20).toFixed(0)} MiB, ${entry.copies.length}/${entry.requestedCopies} copies: ${entry.copies.map((c) => `provider ${c.providerId} (${(c.location ?? '').replace(/;.*$/, '')})`).join(', ')}.`)
-      note(`Piece ${entry.pieceCid}`)
       const missing = await verify()
-      note(missing ? `Verify: ${missing} copy/copies MISSING.` : 'Verify: every copy is in its data set.')
-      if (config.daily?.prune) {
-        const removed = await prune(true)
-        if (removed.length) note(`Pruned ${removed.length} backup(s) older than ${config.keepWeeks} weeks.`)
-      }
-      subject = entry.complete && !missing ? 'Paperless backup: done' : 'Paperless backup: INCOMPLETE'
-      if (subject.endsWith('INCOMPLETE')) process.exitCode = 2
+      const pruned = config.daily?.prune ? (await prune(true)).length : 0
+      report = { kind: entry.complete && !missing ? 'done' : 'incomplete', entry, missing, pruned }
+      if (report.kind === 'incomplete') process.exitCode = 2
     }
-    const acc = await accountSummary()
-    note(`Wallet ${acc.fil} FIL, ${acc.usdfc} USDFC; Filecoin Pay ${acc.available} USDFC available${acc.runwayDays === null ? '' : `, about ${acc.runwayDays} days of runway`}.`)
-    if (acc.runwayDays !== null && acc.runwayDays < (config.daily?.warnRunwayDays ?? 30)) {
-      note('Runway is short: top up with node backup.mjs fund, or the providers may end the storage.')
-      subject += ' (top up soon)'
-    }
+    report.account = await accountSummary()
+    log(`account: ${report.account.fil} FIL, ${report.account.usdfc} USDFC, ${report.account.available} USDFC available, runway ${report.account.runwayDays} days`)
     writeState({ ...state, lastDaily: new Date().toISOString(), lastFingerprint: fingerprint })
-    await sendMail(subject, lines.join('\n'))
+    const mail = renderReport(report)
+    await sendMail(mail.subject, mail.text, mail)
   } catch (err) {
-    note(`FAILED: ${err.shortMessage ?? err.message}`)
+    const error = err.shortMessage ?? err.message
+    log(`FAILED: ${error}`)
     // Retried every hour until it works; mail about it once a day.
     const today = new Date().toISOString().slice(0, 10)
     if (state.lastFailureMail !== today) {
       writeState({ ...state, lastFailureMail: today })
-      await sendMail('Paperless backup: FAILED', lines.join('\n') + '\n\nIt will be retried every hour.').catch((e) => log(`mail failed: ${e.message}`))
+      const account = await accountSummary().catch(() => null)
+      const mail = renderReport({ kind: 'failed', error, account })
+      await sendMail(mail.subject, mail.text, mail).catch((e) => log(`mail failed: ${e.message}`))
     }
     process.exitCode = 1
   }
@@ -643,6 +750,7 @@ const commands = {
   'mail-from-paperless': () => mailFromPaperless(args[0]),
   'mail-check': mailCheck,
   'mail-test': mailTest,
+  'mail-preview': mailPreview,
   restore: () => restore(args[0], args[1]),
   prune: () => prune(args.includes('--yes')),
 }

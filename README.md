@@ -69,7 +69,7 @@ Step-by-step setup: [HOWTO.txt](HOWTO.txt). Auf Deutsch: [ANLEITUNG.txt](ANLEITU
 | `node backup.mjs list` | stored backups |
 | `node backup.mjs restore <pieceCid> [out.zip]` | download, check, decrypt |
 | `node backup.mjs prune --yes` | delete backups older than `keepWeeks` (the newest complete one always stays) |
-| `node backup.mjs mail-from-paperless` / `mail-check` / `mail-test` | take the SMTP login from a Paperless mail account; check the login; send a test report |
+| `node backup.mjs mail-from-paperless` / `mail-check` / `mail-test` / `mail-preview` | take the SMTP login from a Paperless mail account; check the login; send a test report; print the report (and a low-funds and a failure example) without sending |
 | `node backup.mjs daily` | once a day: back up if Paperless changed, verify, prune, mail a report; catches up if the machine was off |
 
 ## Configuration (`config.json`)
@@ -81,7 +81,7 @@ Step-by-step setup: [HOWTO.txt](HOWTO.txt). Auf Deutsch: [ANLEITUNG.txt](ANLEITU
 | `providerIds` | explicit provider ids; still checked against `regions` |
 | `keepWeeks` | how long `prune` keeps backups |
 | `daily` | `time` (when the day's run is due), `fullEveryDays` (upload even without changes), `prune`, `warnRunwayDays` |
-| `mail` | SMTP `host`, `port`, `user`, `from`, `to` for the daily report; password in the keychain (`paperless-backup-smtp`) or `SMTP_PASSWORD_FILE` |
+| `mail` | SMTP `host`, `port`, `user`, `from`, `to`, and `language` (`en` or `de`) for the daily report; password in the keychain (`paperless-backup-smtp`) or `SMTP_PASSWORD_FILE` |
 | `network` | `mainnet` or `calibration` (testnet) |
 
 Environment: `PAPERLESS_DIR` (default: the parent folder), `PAPERLESS_SERVICE` (default `webserver`), `BACKUP_CONFIG`, `WALLET_KEY_FILE`, `AGE_IDENTITY_FILE`, `SMTP_PASSWORD_FILE`.
