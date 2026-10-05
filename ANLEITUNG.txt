@@ -1,0 +1,164 @@
+PAPERLESS-NGX-BACKUP AUF FILECOIN ONCHAIN CLOUD - KURZANLEITUNG
+==============================================================
+
+Was es tut: Einmal am Tag prüft das Skript, ob sich in Paperless etwas
+geändert hat. Wenn ja, exportiert es alles (Dokumente + Datenbank),
+verschlüsselt den Export auf deinem Rechner und speichert ihn gleichzeitig
+bei mehreren unabhängigen Hostern in Europa. Jeder Hoster weist täglich auf
+der Blockchain nach, dass er seine Kopie noch hat.
+
+Kosten: etwa 0,12 $ pro Hoster und Monat plus 2,50 $ pro TiB.
+Ein Archiv von 0,6 GiB bei drei Hostern: rund 0,37 $ im Monat.
+
+Ausführlich (Englisch): HOWTO.txt
+
+
+1. INSTALLIEREN
+---------------
+
+    git clone https://github.com/Le-Space/paperless-backup-filecoin.git
+    cd paperless-backup-filecoin
+    npm install
+    cp config.example.json config.json
+
+Der Ordner gehört neben die docker-compose.yml von Paperless (eine Ebene
+darunter). Sonst PAPERLESS_DIR auf den Paperless-Ordner setzen.
+
+
+2. REGION UND ANZAHL DER KOPIEN
+-------------------------------
+
+In config.json:
+
+    "regions": "EUROPE",    EU, EEA, EUROPE (EWR + UK + CH) oder ["FR","PL","DE"]
+    "copies": 3,            bei wie vielen Hostern eine Kopie liegt
+
+Wer zur Auswahl steht und wer gewählt würde:
+
+    node backup.mjs providers
+
+Den Standort gibt jeder Hoster selbst an; geprüft wird er nicht.
+
+
+3. SCHLÜSSEL ERZEUGEN
+---------------------
+
+    node backup.mjs init-key
+
+Der Schlüssel liegt danach im macOS-Schlüsselbund (Linux: vorher
+AGE_IDENTITY_FILE setzen). WICHTIG: eine zweite Kopie außerhalb des Rechners
+aufbewahren (Passwort-Manager, Papier). Ohne ihn ist kein Backup lesbar:
+
+    security find-generic-password -s paperless-backup-age-identity -a "$USER" -w
+
+
+4. KOSTENLOS IM TESTNETZ AUSPROBIEREN
+-------------------------------------
+
+    cp config.calibration.example.json config.calibration.json
+
+"ageRecipient" aus config.json nach config.calibration.json kopieren.
+Eine Wegwerf-Wallet anlegen (es wird nur die Adresse angezeigt):
+
+    node -e 'import("viem/accounts").then(({generatePrivateKey,privateKeyToAccount})=>{const k=generatePrivateKey();require("fs").writeFileSync("testnet-wallet.key",k+"\n",{mode:0o600});console.log(privateKeyToAccount(k).address)})'
+
+Test-Guthaben für diese Adresse holen:
+  - tFIL:   https://faucet.calibnet.chainsafe-fil.io/funds.html
+  - tUSDFC: https://forest-explorer.chainsafe.dev/faucet/calibnet_usdfc
+
+Dann:
+
+    export BACKUP_CONFIG=config.calibration.json WALLET_KEY_FILE=testnet-wallet.key
+    node backup.mjs status
+    node backup.mjs fund 1
+    node backup.mjs run
+    node backup.mjs verify
+    node backup.mjs restore <pieceCid> test.zip
+    unset BACKUP_CONFIG WALLET_KEY_FILE
+
+test.zip enthält alle Dokumente unverschlüsselt - nach dem Test löschen.
+
+
+5. WALLET UND GUTHABEN (ECHTES NETZ)
+------------------------------------
+
+Bezahlt wird mit
+  - USDFC (an den Dollar gekoppelter Stablecoin auf Filecoin): etwa 10 USDFC
+    reichen bei einem kleinen Archiv viele Monate;
+  - etwas FIL für Gebühren: etwa 0,5 FIL.
+Kartenzahlung gibt es nicht.
+
+USDFC bekommen (FIL in MetaMask im Filecoin-Netzwerk):
+  - SushiSwap auf Filecoin: FIL gegen USDFC tauschen - am einfachsten
+  - Squid Router (https://app.squidrouter.com): aus anderen Netzen/Token
+  - Nicht empfohlen: die USDFC-App (app.usdfc.net) verleiht USDFC gegen FIL
+    als Sicherheit - ein Kredit, der bei fallendem FIL liquidiert werden kann.
+
+USDFC-Token in MetaMask (Filecoin Mainnet, Chain-ID 314):
+    0x80B98d3aa09ffff255c3ba4A241111Ff1262F045   Symbol USDFC, 18 Dezimalstellen
+
+EIGENES KONTO NUR FÜR DAS BACKUP. In MetaMask "Konto hinzufügen", dorthin
+10-15 USDFC und 0,5 FIL schicken. Dem Skript nur den PRIVATEN SCHLÜSSEL
+dieses Kontos geben (Kontodetails > Privaten Schlüssel anzeigen; 64
+Hex-Zeichen) - nicht die Seed Phrase. Eintragen, unsichtbare Eingabe:
+
+    security add-generic-password -s paperless-backup-filecoin-wallet -a "$USER" -w
+
+Dann:
+
+    node backup.mjs status       Guthaben und Bereitschaft
+    node backup.mjs fund 3       Vorauszahlung für etwa drei Monate
+
+
+6. ERSTES BACKUP
+----------------
+
+    node backup.mjs run
+    node backup.mjs verify
+    node backup.mjs list
+
+
+7. TÄGLICH AUTOMATISCH, NUR BEI ÄNDERUNGEN
+------------------------------------------
+
+    node backup.mjs daily
+
+läuft höchstens einmal am Tag (ab "daily.time", Standard 03:30): sichert
+nur, wenn sich in Paperless etwas geändert hat (spätestens alle 7 Tage
+trotzdem), prüft die Kopien, räumt Stände älter als "keepWeeks" weg und
+schickt eine kurze Mail. Ein zweiter Start am selben Tag beendet sich still.
+Unter macOS per launchd um 03:30, stündlich und bei der Anmeldung starten -
+so holt ein nachts ausgeschalteter Mac das Backup nach. Vorlage: HOWTO.txt,
+Schritt 8.
+
+Mail: Abschnitt "mail" in config.json ausfüllen, SMTP-Passwort eintragen:
+
+    security add-generic-password -s paperless-backup-smtp -a "$USER" -w
+
+
+8. WIEDERHERSTELLEN
+-------------------
+
+    node backup.mjs restore <pieceCid>
+
+Auf einem neuen Rechner: ledger.json und den age-Schlüssel mitnehmen, dann
+AGE_IDENTITY_FILE=key.txt node backup.mjs restore <pieceCid>
+ZIP entpacken und in ein leeres Paperless einspielen:
+
+    docker compose exec webserver document_importer ../export/<ordner>
+
+
+9. WENN ETWAS SCHIEFGEHT
+------------------------
+
+  "no wallet key"                  Schlüssel noch nicht eingetragen (Schritt 5)
+  "invalid private key"            Seed Phrase statt privatem Schlüssel gespeichert
+  "not ready: deposit … needed"    node backup.mjs fund
+  "Insufficient balance"           zu wenig USDFC oder kein FIL für Gebühren
+  "EIP2612: expired deadline"      Uhr des Rechners geht falsch -> automatische Zeit einschalten
+  "… not (or no longer) approved"  ein gewählter Hoster ist nicht mehr zugelassen
+  "… copies wanted, but only …"    zu wenige Hoster in der Region
+  "… (INCOMPLETE)"                 weniger Kopien als gewünscht; verify, dann erneut run
+
+Ein Backup auf Filecoin ist ein Standbein einer 3-2-1-Sicherung, nicht alles:
+eine weitere Kopie lokal oder auf Speicher mit Object Lock behalten.

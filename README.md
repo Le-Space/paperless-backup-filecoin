@@ -53,7 +53,7 @@ Try it yourself for free: [HOWTO.txt](HOWTO.txt), step 5. What every command pri
 - Node.js 22+
 - A Filecoin wallet with a few USDFC (storage) and a little FIL (gas). There is no card payment; FIL can be bought at an exchange and swapped for USDFC.
 
-Step-by-step setup: [HOWTO.txt](HOWTO.txt).
+Step-by-step setup: [HOWTO.txt](HOWTO.txt). Auf Deutsch: [ANLEITUNG.txt](ANLEITUNG.txt).
 
 ## Commands
 
