@@ -45,7 +45,7 @@ What it taught, now in the script:
 - A first attempt failed because the primary provider stopped answering after the upload. `run` now retries with the next chosen provider as primary — the set of providers, and so the region, stays the same.
 - The Mac's clock was an hour slow, and the deposit was refused (`EIP2612: expired deadline`): the permit had expired by chain time. Keep the system clock synced.
 
-Try it yourself for free: [HOWTO.txt](HOWTO.txt), step 5.
+Try it yourself for free: [HOWTO.txt](HOWTO.txt), step 5. What every command prints on a good run, and what the common errors mean: [HOWTO.txt](HOWTO.txt), step 11.
 
 ## Requirements
 

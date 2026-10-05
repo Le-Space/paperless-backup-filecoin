@@ -216,3 +216,93 @@ Unzip the result and import it into an empty Paperless:
 - A hoster dropped from the approved list? Same: the run stops and says which.
 - Keep at least one more copy elsewhere (NAS, object storage with object lock).
   This is one leg of a 3-2-1 backup, not all of it.
+
+
+11. WHAT THE OUTPUT SHOULD LOOK LIKE
+------------------------------------
+
+The lines come from real runs on mainnet and on the Calibration testnet;
+addresses, hashes, ids and amounts are examples. Times are UTC. If yours
+looks like this, it worked.
+
+providers - who would be chosen (columns: id | chosen | in region |
+tier | active | declared location | name):
+
+    $ node backup.mjs providers
+      1 | chosen | region | endorsed | active | C=GB;ST=Gloucestershire;L=Cheltenham | ezpdpz-main
+      5 |        |        | endorsed | active | C=US;ST=California;L=Chino | Mongo2Stor Mainnet
+     36 | chosen | region | endorsed | active | C=FR;ST=Grand Est;L=Strasbourg | Cello
+     37 | chosen | region | endorsed | active | C=PL;ST=Mazowieckie;L=Warsaw | Bass
+
+plan - dry run, nothing leaves the machine:
+
+    $ node backup.mjs plan
+    2026-10-04T11:32:33.060Z exporting Paperless …
+    2026-10-04T11:34:21.672Z decryption check: ok
+    2026-10-04T11:34:21.673Z paperless-2026-10-04: 631848030 bytes encrypted (0.59 GiB)
+    2026-10-04T11:34:21.673Z providers: 36 Cello (C=FR;...); 37 Bass (C=PL;...); 1 ezpdpz-main (C=GB;...)
+    2026-10-04T11:34:21.673Z estimate: ~0.364 USD per month for 3 copies (...)
+
+status - before funding (FIL > 0 is needed for fees):
+
+    $ node backup.mjs status
+    2026-10-05T10:06:19.000Z network Filecoin - Mainnet, account 0xYourBackupAccount…
+    2026-10-05T10:06:19.700Z wallet: 1 FIL, 10.38 USDFC; available in Filecoin Pay: 0 USDFC
+    2026-10-05T10:06:21.415Z for 1 GiB on providers 36, 37, 1: 0.367 USDFC per month
+    2026-10-05T10:06:21.415Z not ready: deposit 1.867 USDFC needed (node backup.mjs fund)
+
+fund - one transaction, deposit and approval together:
+
+    $ node backup.mjs fund 3
+    2026-10-05T10:08:35.670Z rate 0.3746 USDFC per month for 2 GiB on 3 providers
+    2026-10-05T10:08:35.673Z depositing 2.9986 USDFC and approving the storage service …
+    2026-10-05T10:09:40.000Z confirmed: 0x<transaction hash>
+
+status - after funding:
+
+    $ node backup.mjs status
+    2026-10-05T10:12:45.332Z wallet: 0.99996 FIL, 7.388 USDFC; available in Filecoin Pay: 2.9986 USDFC
+    2026-10-05T10:12:46.769Z for 1 GiB on providers 36, 37, 1: 0.367 USDFC per month
+    2026-10-05T10:12:46.769Z ready to upload
+
+run - export, encrypt, upload (minutes, depending on size and uplink):
+
+    $ node backup.mjs run
+    2026-10-05T06:38:29.890Z exporting Paperless …
+    2026-10-05T06:39:42.993Z uploading 631848030 bytes to providers 36, 37, 1 (primary 36) …
+    2026-10-05T06:50:34.691Z piece bafkzcib…: 3/3 copies
+
+  If a provider does not answer, you see a retry with the next one first:
+    … upload with primary 36 failed: Failed to store piece on service provider 36 (…)
+    … uploading 631848030 bytes to providers 37, 1, 36 (primary 37) …
+
+verify - every copy in its data set:
+
+    $ node backup.mjs verify
+    2026-10-05T06:50:51.792Z ok      data set 41709 (provider 36) bafkzcib…
+    2026-10-05T06:50:52.208Z ok      data set 41710 (provider 37) bafkzcib…
+    2026-10-05T06:50:52.608Z ok      data set 41711 (provider 1) bafkzcib…
+
+list:
+
+    $ node backup.mjs list
+    2026-10-05 | complete | bafkzcib… | 603 MiB | 36@C=FR 37@C=PL 1@C=GB
+
+restore - downloaded, checksum checked, decrypted:
+
+    $ node backup.mjs restore bafkzcib… restore-test.zip
+    2026-10-05T06:53:40.649Z restored to restore-test.zip; import into an empty Paperless with: document_importer <dir-with-unzipped-export>
+
+The restored zip contains every document unencrypted. Delete it when the
+test is done.
+
+Signs that something is wrong:
+  "no wallet key"                  step 6: the key is not stored yet
+  "invalid private key"            a seed phrase was stored instead of the
+                                   account's private key (64 hex characters)
+  "not ready: deposit … needed"    run node backup.mjs fund
+  "Insufficient balance"           not enough USDFC (or no FIL for fees)
+  "EIP2612: expired deadline"      the computer's clock is off
+  "… not (or no longer) approved"  a chosen provider left the approved list
+  "… copies wanted, but only …"    too few providers in your region
+  "… (INCOMPLETE)"                 fewer copies than asked; run verify, then run again
