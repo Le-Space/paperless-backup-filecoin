@@ -21,7 +21,7 @@
 //   node backup.mjs mail-check      log in to the SMTP server, send nothing
 //   node backup.mjs mail-test [--warning]   send one test report (--warning: as if funds ran low)
 
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { platform } from 'node:os'
@@ -35,6 +35,12 @@ import { getEndorsedProviderIds } from '@filoz/synapse-core/endorsements'
 import { createPublicClient, http } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import nodemailer from 'nodemailer'
+import { Agent, setGlobalDispatcher } from 'undici'
+
+// A provider answers an upload only after it has hashed the whole piece, which
+// for a backup of several hundred MB takes longer than the 5 minutes Node's
+// fetch waits for response headers by default ("Headers Timeout Error").
+setGlobalDispatcher(new Agent({ headersTimeout: 60 * 60 * 1000, bodyTimeout: 60 * 60 * 1000 }))
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PAPERLESS = process.env.PAPERLESS_DIR ?? join(HERE, '..')
@@ -51,6 +57,18 @@ const EU = ['AT', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FI', 'FR', 'DE', 'G
 const EEA = [...EU, 'IS', 'LI', 'NO']
 const REGION_PRESETS = { EU, EEA, EUROPE: [...EEA, 'GB', 'CH'] }
 const DAY = 24 * 60 * 60 * 1000
+const HOUR = 60 * 60 * 1000
+
+// The whole cause chain: the SDK wraps the provider's answer two levels deep.
+function describeError(err) {
+  const parts = []
+  for (let e = err, i = 0; e && i < 6; e = e.cause, i++) {
+    const text = e.shortMessage ?? e.message ?? String(e)
+    if (!parts.includes(text)) parts.push(text)
+    if (e.status) parts.push(`HTTP ${e.status}`)
+  }
+  return parts.join(' <- ')
+}
 
 if (!existsSync(CONFIG_PATH)) {
   console.error(`error: no ${CONFIG_PATH}; copy config.example.json to config.json`)
@@ -327,7 +345,7 @@ async function uploadWithRetry(s, chosen, bytes) {
       return await s.storage.upload(bytes, { contexts })
     } catch (err) {
       lastError = err
-      log(`upload with primary ${order[0].id} failed: ${err.shortMessage ?? err.message}`)
+      log(`upload with primary ${order[0].id} failed: ${describeError(err)}`)
       if (attempt + 1 < chosen.length) await new Promise((r) => setTimeout(r, 30_000))
     }
   }
@@ -695,10 +713,33 @@ function renderReport(r) {
 // Started at the daily time and every hour after (launchd): the first start
 // after the due time does the work, later ones exit quietly. A machine that
 // was off at 03:30 therefore catches up within the hour after it is back.
+// One run at a time: launchd and a run started by hand must not overlap.
+function takeLock() {
+  const lock = join(HERE, 'daily.lock')
+  if (existsSync(lock)) {
+    const pid = Number(readFileSync(lock, 'utf8'))
+    try {
+      process.kill(pid, 0)
+      return false
+    } catch {}
+  }
+  writeFileSync(lock, String(process.pid))
+  process.on('exit', () => rmSync(lock, { force: true }))
+  return true
+}
+
 async function daily() {
   const state = readState()
   const due = lastDueTime()
   if (state.lastDaily && Date.parse(state.lastDaily) >= due.getTime()) return
+  // After failures, wait 1, 2, 4, then 8 hours between attempts instead of
+  // uploading the whole backup every hour; a run after a longer pause (the
+  // Mac was off) is never held back.
+  const backoff = Math.min(2 ** Math.max((state.failures ?? 0) - 1, 0), 8) * HOUR
+  if (state.lastFailureAt && Date.now() - Date.parse(state.lastFailureAt) < backoff) return
+  if (!takeLock()) return
+  // Keep the Mac awake while the backup runs (idle sleep cut an upload once).
+  if (platform() === 'darwin') spawn('caffeinate', ['-i', '-w', String(process.pid)], { stdio: 'ignore', detached: true }).unref()
   try {
     const fingerprint = paperlessFingerprint()
     const lastUpload = readLedger().filter((e) => e.complete && !e.deleted).at(-1)
@@ -716,16 +757,19 @@ async function daily() {
     }
     report.account = await accountSummary()
     log(`account: ${report.account.fil} FIL, ${report.account.usdfc} USDFC, ${report.account.available} USDFC available, runway ${report.account.runwayDays} days`)
-    writeState({ ...state, lastDaily: new Date().toISOString(), lastFingerprint: fingerprint })
+    writeState({ ...state, lastDaily: new Date().toISOString(), lastFingerprint: fingerprint, failures: 0, lastFailureAt: undefined })
     const mail = renderReport(report)
     await sendMail(mail.subject, mail.text, mail)
   } catch (err) {
     const error = err.shortMessage ?? err.message
-    log(`FAILED: ${error}`)
-    // Retried every hour until it works; mail about it once a day.
+    log(`FAILED: ${describeError(err)}`)
+    const failures = (state.failures ?? 0) + 1
+    writeState({ ...state, failures, lastFailureAt: new Date().toISOString() })
+    log(`attempt ${failures} failed; next attempt in ${Math.min(2 ** (failures - 1), 8)} h at the earliest`)
+    // Mail about it once a day.
     const today = new Date().toISOString().slice(0, 10)
     if (state.lastFailureMail !== today) {
-      writeState({ ...state, lastFailureMail: today })
+      writeState({ ...readState(), lastFailureMail: today })
       const account = await accountSummary().catch(() => null)
       const mail = renderReport({ kind: 'failed', error, account })
       await sendMail(mail.subject, mail.text, mail).catch((e) => log(`mail failed: ${e.message}`))

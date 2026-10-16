@@ -10,3 +10,4 @@ config.calibration.json
 *.key
 state.json
 state.calibration.json
+daily.lock
