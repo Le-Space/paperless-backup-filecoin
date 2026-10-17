@@ -30,7 +30,9 @@
 
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createReadStream, createWriteStream, existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { Readable, Transform, Writable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import { platform } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -345,25 +347,42 @@ function exportPaperless(name) {
   return zip
 }
 
+// Bytes pass through, and into `hash` on the way.
+const hashing = (hash) => new Transform({ transform(chunk, _, done) { hash.update(chunk); done(null, chunk) } })
+
+// A file as a web stream, hashed as it is read.
+const fileStream = (path, hash) => Readable.toWeb(hash ? createReadStream(path).pipe(hashing(hash)) : createReadStream(path))
+
 // The plain export holds every document and the mail credentials, so it lives
-// only as long as the encryption takes.
+// only as long as the encryption takes. Everything streams: the zip through
+// age into an encrypted file beside it, hashing both on the way, so memory
+// stays small whatever the archive's size (a VM with a few GB runs Paperless
+// beside it). The caller removes the encrypted file when it is done with it.
 async function encryptedExport() {
   if (!config.ageRecipient) fail('no ageRecipient in config.json; run: node backup.mjs init-key')
   const name = `paperless-${new Date().toISOString().slice(0, 10)}`
   const zip = exportPaperless(name)
+  const sealedPath = join(EXPORT_DIR, `${name}.age`)
   try {
-    const plain = readFileSync(zip)
+    const plainHash = createHash('sha256')
+    const sealedHash = createHash('sha256')
     const e = new Encrypter()
     e.addRecipient(config.ageRecipient)
-    const sealed = await e.encrypt(plain)
-    if (sealed.byteLength > MAX_UPLOAD) fail(`encrypted export is ${sealed.byteLength} bytes, above the 64 GiB limit`)
+    const sealedStream = await e.encrypt(fileStream(zip, plainHash))
+    await pipeline(Readable.fromWeb(sealedStream), hashing(sealedHash), createWriteStream(sealedPath, { mode: 0o600 }))
+    const sealedBytes = statSync(sealedPath).size
+    if (sealedBytes > MAX_UPLOAD) fail(`encrypted export is ${sealedBytes} bytes, above the 64 GiB limit`)
     return {
       name,
-      sealed,
-      plainBytes: plain.byteLength,
-      plainSha256: createHash('sha256').update(plain).digest('hex'),
-      sealedSha256: createHash('sha256').update(sealed).digest('hex'),
+      sealedPath,
+      sealedBytes,
+      plainBytes: statSync(zip).size,
+      plainSha256: plainHash.digest('hex'),
+      sealedSha256: sealedHash.digest('hex'),
     }
+  } catch (err) {
+    rmSync(sealedPath, { force: true })
+    throw err
   } finally {
     rmSync(zip, { force: true })
     rmSync(join(EXPORT_DIR, name), { recursive: true, force: true })
@@ -425,16 +444,21 @@ async function fund(months = 3) {
 
 async function plan() {
   const chosen = await resolveProviders()
-  const { name, sealed, plainSha256 } = await encryptedExport()
-  // Prove the keychain identity opens what the recipient sealed, before anything leaves this Mac.
-  const d = new Decrypter()
-  d.addIdentity(ageIdentity())
-  const reopened = createHash('sha256').update(await d.decrypt(sealed)).digest('hex')
-  if (reopened !== plainSha256) fail('decryption check failed: the keychain identity does not open the backup')
-  log('decryption check: ok')
-  const gib = sealed.byteLength / 2 ** 30
-  const perCopy = (sealed.byteLength / 2 ** 40) * 2.5 + 0.12
-  log(`${name}: ${sealed.byteLength} bytes encrypted (${gib.toFixed(2)} GiB)`)
+  const { name, sealedPath, sealedBytes, plainSha256 } = await encryptedExport()
+  try {
+    // Prove the keychain identity opens what the recipient sealed, before anything leaves this Mac.
+    const d = new Decrypter()
+    d.addIdentity(ageIdentity())
+    const reopenedHash = createHash('sha256')
+    await pipeline(Readable.fromWeb(await d.decrypt(fileStream(sealedPath))), hashing(reopenedHash), new Writable({ write(_, __, done) { done() } }))
+    if (reopenedHash.digest('hex') !== plainSha256) fail('decryption check failed: the keychain identity does not open the backup')
+    log('decryption check: ok')
+  } finally {
+    rmSync(sealedPath, { force: true })
+  }
+  const gib = sealedBytes / 2 ** 30
+  const perCopy = (sealedBytes / 2 ** 40) * 2.5 + 0.12
+  log(`${name}: ${sealedBytes} bytes encrypted (${gib.toFixed(2)} GiB)`)
   log(`providers: ${chosen.map((p) => `${p.id} ${p.name} (${p.location})`).join('; ')}`)
   log(`estimate: ~${(perCopy * chosen.length).toFixed(3)} USD per month for ${chosen.length} copies (one piece; each further kept week adds the storage part)`)
 }
@@ -442,14 +466,15 @@ async function plan() {
 // The primary copy is the one this machine uploads; the others pull from it.
 // A primary that stops answering fails the whole upload, so each retry puts
 // the next chosen provider first. The set of providers never changes.
-async function uploadWithRetry(s, chosen, bytes) {
+async function uploadWithRetry(s, chosen, backup) {
   let lastError
   for (let attempt = 0; attempt < chosen.length; attempt++) {
     const order = [...chosen.slice(attempt), ...chosen.slice(0, attempt)]
     const contexts = await s.storage.createContexts({ providerIds: order.map((p) => BigInt(p.id)), metadata: config.datasetMetadata })
-    log(`uploading ${bytes.byteLength} bytes to providers ${order.map((p) => p.id).join(', ')} (primary ${order[0].id}) …`)
+    log(`uploading ${backup.sealedBytes} bytes to providers ${order.map((p) => p.id).join(', ')} (primary ${order[0].id}) …`)
     try {
-      return await s.storage.upload(bytes, { contexts })
+      // A fresh stream from the encrypted file for every attempt.
+      return await s.storage.upload(fileStream(backup.sealedPath), { contexts })
     } catch (err) {
       lastError = err
       log(`upload with primary ${order[0].id} failed: ${describeError(err)}`)
@@ -463,27 +488,31 @@ async function runBackup() {
   const chosen = await resolveProviders()
   const s = await synapse()
   const backup = await encryptedExport()
-  const { transaction } = await s.storage.prepare({ context: await chosenContexts(s), pieceSizes: [BigInt(backup.sealed.byteLength)] })
-  if (transaction) fail(`account not funded for this upload (needs ${formatUnits(transaction.depositAmount)} USDFC); run: node backup.mjs fund`)
+  try {
+    const { transaction } = await s.storage.prepare({ context: await chosenContexts(s), pieceSizes: [BigInt(backup.sealedBytes)] })
+    if (transaction) fail(`account not funded for this upload (needs ${formatUnits(transaction.depositAmount)} USDFC); run: node backup.mjs fund`)
 
-  const result = await uploadWithRetry(s, chosen, backup.sealed)
-  const entry = jsonable({
-    name: backup.name,
-    date: new Date().toISOString(),
-    pieceCid: result.pieceCid.toString(),
-    size: backup.sealed.byteLength,
-    plainBytes: backup.plainBytes,
-    plainSha256: backup.plainSha256,
-    sealedSha256: backup.sealedSha256,
-    complete: result.complete,
-    requestedCopies: result.requestedCopies,
-    copies: result.copies.map((c) => ({ ...c, location: chosen.find((p) => p.id === Number(c.providerId))?.location })),
-    failedAttempts: result.failedAttempts,
-    deleted: false,
-  })
-  writeLedger([...readLedger(), entry])
-  log(`piece ${entry.pieceCid}: ${result.copies.length}/${result.requestedCopies} copies${result.complete ? '' : ' (INCOMPLETE)'}`)
-  return entry
+    const result = await uploadWithRetry(s, chosen, backup)
+    const entry = jsonable({
+      name: backup.name,
+      date: new Date().toISOString(),
+      pieceCid: result.pieceCid.toString(),
+      size: backup.sealedBytes,
+      plainBytes: backup.plainBytes,
+      plainSha256: backup.plainSha256,
+      sealedSha256: backup.sealedSha256,
+      complete: result.complete,
+      requestedCopies: result.requestedCopies,
+      copies: result.copies.map((c) => ({ ...c, location: chosen.find((p) => p.id === Number(c.providerId))?.location })),
+      failedAttempts: result.failedAttempts,
+      deleted: false,
+    })
+    writeLedger([...readLedger(), entry])
+    log(`piece ${entry.pieceCid}: ${result.copies.length}/${result.requestedCopies} copies${result.complete ? '' : ' (INCOMPLETE)'}`)
+    return entry
+  } finally {
+    rmSync(backup.sealedPath, { force: true })
+  }
 }
 
 function list() {
