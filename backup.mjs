@@ -230,15 +230,47 @@ async function resolveProviders() {
 // Thumbnails go into the export (a few percent of its size): a Paperless
 // restored on a machine that runs only for a few hours should not spend the
 // first half hour regenerating them with document_thumbnails.
+//
+// The exporter writes into a fresh directory, not straight into a zip (-z):
+// into a directory it numbers files whose --use-filename-format names clash,
+// into a zip it writes the same name twice, and one document's archive PDF or
+// thumbnail then overwrites another's on restore. The zip is made afterwards,
+// with the same layout (manifest.json at the top), and refused if any name
+// still occurs twice.
+const ZIP_EXPORT = `
+import os, shutil, sys, zipfile
+src, out = sys.argv[1], sys.argv[2]
+names = []
+with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+    for root, dirs, files in os.walk(src):
+        dirs.sort()
+        for f in sorted(files):
+            path = os.path.join(root, f)
+            name = os.path.relpath(path, src)
+            names.append(name)
+            z.write(path, name)
+shutil.rmtree(src)
+dupes = len(names) - len(set(names))
+if dupes or 'manifest.json' not in names:
+    sys.exit(f'export zip refused: {dupes} duplicate names, manifest present: {"manifest.json" in names}')
+print(len(names))
+`
+
 function exportPaperless(name) {
   log('exporting Paperless …')
-  execFileSync(
-    'docker',
-    ['compose', 'exec', '-T', '-u', 'paperless', PAPERLESS_SERVICE, 'document_exporter', '../export', '-z', '-zn', name, '--use-filename-format', '--no-progress-bar'],
-    { cwd: PAPERLESS, stdio: ['ignore', 'ignore', 'inherit'] },
-  )
+  const inContainer = (args, opts = {}) =>
+    execFileSync('docker', ['compose', 'exec', '-T', '-u', 'paperless', PAPERLESS_SERVICE, ...args], {
+      cwd: PAPERLESS,
+      stdio: ['ignore', opts.capture ? 'pipe' : 'ignore', 'inherit'],
+      encoding: 'utf8',
+    })
+  rmSync(join(EXPORT_DIR, name), { recursive: true, force: true })
+  inContainer(['mkdir', '-p', `../export/${name}`])
+  inContainer(['document_exporter', `../export/${name}`, '--use-filename-format', '--no-progress-bar'])
+  const files = inContainer(['python3', '-c', ZIP_EXPORT, `../export/${name}`, `../export/${name}.zip`], { capture: true }).trim()
   const zip = join(EXPORT_DIR, `${name}.zip`)
   if (!existsSync(zip)) fail(`export did not produce ${zip}`)
+  log(`export: ${files} files, no duplicate names`)
   return zip
 }
 
@@ -263,6 +295,7 @@ async function encryptedExport() {
     }
   } finally {
     rmSync(zip, { force: true })
+    rmSync(join(EXPORT_DIR, name), { recursive: true, force: true })
   }
 }
 
