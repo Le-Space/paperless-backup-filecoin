@@ -227,11 +227,14 @@ async function resolveProviders() {
 
 // --- export + encryption ----------------------------------------------------
 
+// Thumbnails go into the export (a few percent of its size): a Paperless
+// restored on a machine that runs only for a few hours should not spend the
+// first half hour regenerating them with document_thumbnails.
 function exportPaperless(name) {
   log('exporting Paperless …')
   execFileSync(
     'docker',
-    ['compose', 'exec', '-T', '-u', 'paperless', PAPERLESS_SERVICE, 'document_exporter', '../export', '-z', '-zn', name, '--use-filename-format', '--no-thumbnail', '--no-progress-bar'],
+    ['compose', 'exec', '-T', '-u', 'paperless', PAPERLESS_SERVICE, 'document_exporter', '../export', '-z', '-zn', name, '--use-filename-format', '--no-progress-bar'],
     { cwd: PAPERLESS, stdio: ['ignore', 'ignore', 'inherit'] },
   )
   const zip = join(EXPORT_DIR, `${name}.zip`)
