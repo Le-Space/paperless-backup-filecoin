@@ -71,6 +71,8 @@ Step-by-step setup: [HOWTO.txt](HOWTO.txt). Auf Deutsch: [ANLEITUNG.txt](ANLEITU
 | `node backup.mjs prune --yes` | delete backups older than `keepWeeks` (the newest complete one always stays) |
 | `node backup.mjs mail-from-paperless` / `mail-check` / `mail-test` / `mail-preview` | take the SMTP login from a Paperless mail account; check the login; send a test report; print the report (and a low-funds and a failure example) without sending |
 | `node backup.mjs daily` | once a day: back up if Paperless changed, verify, prune, mail a report; catches up if the machine was off |
+| `node backup.mjs session-login <hours> <key-file>` | with the wallet: create a session key that may create data sets and add pieces until it expires (at most 168 h), and write it to `<key-file>` |
+| `node backup.mjs session-revoke <address>` | with the wallet: withdraw a session key |
 
 ## Configuration (`config.json`)
 
@@ -83,8 +85,17 @@ Step-by-step setup: [HOWTO.txt](HOWTO.txt). Auf Deutsch: [ANLEITUNG.txt](ANLEITU
 | `daily` | `time` (when the day's run is due), `fullEveryDays` (upload even without changes), `prune`, `warnRunwayDays` |
 | `mail` | SMTP `host`, `port`, `user`, `from`, `to`, and `language` (`en` or `de`) for the daily report; password in the keychain (`paperless-backup-smtp`) or `SMTP_PASSWORD_FILE` |
 | `network` | `mainnet` or `calibration` (testnet) |
+| `payer` | the wallet address a session key acts for (or `PAYER_ADDRESS`) |
 
-Environment: `PAPERLESS_DIR` (default: the parent folder), `PAPERLESS_SERVICE` (default `webserver`), `BACKUP_CONFIG`, `WALLET_KEY_FILE`, `AGE_IDENTITY_FILE`, `SMTP_PASSWORD_FILE`.
+Environment: `PAPERLESS_DIR` (default: the parent folder), `PAPERLESS_SERVICE` (default `webserver`), `BACKUP_CONFIG`, `WALLET_KEY_FILE`, `AGE_IDENTITY_FILE`, `SMTP_PASSWORD_FILE`, `SESSION_KEY_FILE`, `PAYER_ADDRESS`, `PAPERLESS_MANAGE` (a command that takes `manage.py`'s arguments, where `docker compose exec` does not work).
+
+## Backing up from a machine that must not hold the wallet
+
+A machine that runs Paperless only for a while, a rented VM for example, can back up without the wallet key:
+
+1. With the wallet, create a session key: `node backup.mjs session-login 8 session.key`. It may **create data sets and add pieces** until it expires, and nothing else. It cannot delete pieces, end storage or move funds. Storage is paid from the wallet's deposit in Filecoin Pay, so an operator approval with low limits caps what a session key can spend.
+2. On the machine, set `SESSION_KEY_FILE` to that key and `payer` in `config.json` to the wallet address, then run `run` or `daily`. It does not need the age identity: backups are encrypted to `ageRecipient`, the public half. `prune` refuses there.
+3. When the machine is done, `node backup.mjs session-revoke <address>` withdraws the key; otherwise it expires.
 
 ## Limits — read before relying on it
 

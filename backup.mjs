@@ -5,6 +5,11 @@
 // machine and uploaded as one piece to several independent storage providers,
 // chosen by id or by region and number of copies (config.json).
 // Secrets: the macOS keychain, or files named by WALLET_KEY_FILE / AGE_IDENTITY_FILE.
+// With SESSION_KEY_FILE (and config.payer) uploads are signed by a session key
+// the wallet authorized for adding pieces only, never by the wallet itself: a
+// machine that holds it can back up within the wallet's deposit, and cannot
+// delete pieces, end storage or move funds. PAPERLESS_MANAGE names a command
+// that runs manage.py where `docker compose exec` does not work.
 //
 //   node backup.mjs init-key        create the age identity (once)
 //   node backup.mjs providers       approved providers, their location, region check
@@ -16,6 +21,8 @@
 //   node backup.mjs verify          is every copy still in its data set?
 //   node backup.mjs restore <pieceCid> [out.zip]
 //   node backup.mjs prune --yes     delete pieces older than keepWeeks
+//   node backup.mjs session-login <hours> <key-file>   authorize a new session key (add pieces only)
+//   node backup.mjs session-revoke <address>           withdraw a session key
 //   node backup.mjs daily           once a day: back up if Paperless changed, verify, prune, mail
 //   node backup.mjs mail-from-paperless [account name]   take SMTP login from a Paperless mail account
 //   node backup.mjs mail-check      log in to the SMTP server, send nothing
@@ -32,8 +39,9 @@ import { Synapse, TOKENS, calibration, formatUnits, mainnet } from '@filoz/synap
 import { getPDPProvidersByIds } from '@filoz/synapse-core/sp-registry'
 import { getApprovedProviderIds } from '@filoz/synapse-core/warm-storage'
 import { getEndorsedProviderIds } from '@filoz/synapse-core/endorsements'
-import { createPublicClient, http } from 'viem'
-import { privateKeyToAccount } from 'viem/accounts'
+import * as SessionKey from '@filoz/synapse-core/session-key'
+import { createPublicClient, createWalletClient, http } from 'viem'
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import nodemailer from 'nodemailer'
 import { Agent, setGlobalDispatcher } from 'undici'
 
@@ -140,9 +148,53 @@ const jsonable = (value) => JSON.parse(JSON.stringify(value, (_, v) => (typeof v
 
 // --- chain ------------------------------------------------------------------
 
-function synapse() {
+// What a session key may do: create a data set and add pieces. Removing
+// pieces (prune) and terminating storage stay with the wallet.
+const SESSION_PERMISSIONS = [SessionKey.CreateDataSetPermission, SessionKey.AddPiecesPermission]
+
+async function synapse() {
+  const sessionFile = process.env.SESSION_KEY_FILE
+  if (sessionFile) {
+    const root = config.payer ?? process.env.PAYER_ADDRESS
+    if (!/^0x[0-9a-fA-F]{40}$/.test(root ?? '')) fail('SESSION_KEY_FILE needs the payer address: config.payer or PAYER_ADDRESS')
+    const raw = readFileSync(sessionFile, 'utf8').trim()
+    const sessionKey = SessionKey.fromSecp256k1({ privateKey: raw.startsWith('0x') ? raw : `0x${raw}`, root, chain })
+    await sessionKey.syncExpirations(SESSION_PERMISSIONS)
+    const s = Synapse.create({ account: root, chain, sessionKey, requiredPermissions: SESSION_PERMISSIONS, source: 'paperless-backup' })
+    return Object.assign(s, { address: root, sessionAddress: sessionKey.address })
+  }
   const account = privateKeyToAccount(walletKey())
   return Object.assign(Synapse.create({ account, chain, source: 'paperless-backup' }), { address: account.address })
+}
+
+// --- session keys (run with the wallet) ---------------------------------------
+
+function walletClient() {
+  return createWalletClient({ account: privateKeyToAccount(walletKey()), chain, transport: http() })
+}
+
+async function sessionLogin(hours, keyFile) {
+  if (!(hours > 0 && hours <= 24 * 7)) fail('usage: node backup.mjs session-login <hours, up to 168> <key-file>')
+  if (!keyFile) fail('usage: node backup.mjs session-login <hours> <key-file>')
+  if (existsSync(keyFile)) fail(`${keyFile} exists; refusing to overwrite a key`)
+  const privateKey = generatePrivateKey()
+  const address = privateKeyToAccount(privateKey).address
+  writeFileSync(keyFile, `${privateKey}\n`, { mode: 0o600 })
+  const expiresAt = BigInt(Math.floor(Date.now() / 1000 + hours * 3600))
+  try {
+    await SessionKey.loginSync(walletClient(), { address, permissions: SESSION_PERMISSIONS, expiresAt })
+  } catch (err) {
+    rmSync(keyFile, { force: true })
+    throw err
+  }
+  log(`session key ${address} may create data sets and add pieces until ${new Date(Number(expiresAt) * 1000).toISOString()}; key in ${keyFile}`)
+  return address
+}
+
+async function sessionRevoke(address) {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address ?? '')) fail('usage: node backup.mjs session-revoke <session key address>')
+  await SessionKey.revokeSync(walletClient(), { address, permissions: SESSION_PERMISSIONS })
+  log(`session key ${address} revoked`)
 }
 
 async function chosenContexts(s) {
@@ -256,6 +308,18 @@ if dupes or 'manifest.json' not in names:
 print(len(names))
 `
 
+// manage.py in the Paperless container: `docker compose exec` by default, or
+// PAPERLESS_MANAGE (a command taking manage.py's arguments) where exec does not
+// work, as in the confidential guest. Its export directory is EXPORT_DIR.
+const PAPERLESS_MANAGE = process.env.PAPERLESS_MANAGE
+
+function manage(args, opts = {}) {
+  const stdio = ['ignore', opts.capture ? 'pipe' : 'ignore', opts.quiet ? 'ignore' : 'inherit']
+  return PAPERLESS_MANAGE
+    ? execFileSync(PAPERLESS_MANAGE, args, { stdio, encoding: 'utf8' })
+    : execFileSync('docker', ['compose', 'exec', '-T', '-u', 'paperless', PAPERLESS_SERVICE, 'python3', 'manage.py', ...args], { cwd: PAPERLESS, stdio, encoding: 'utf8' })
+}
+
 function exportPaperless(name) {
   log('exporting Paperless …')
   const inContainer = (args, opts = {}) =>
@@ -265,9 +329,16 @@ function exportPaperless(name) {
       encoding: 'utf8',
     })
   rmSync(join(EXPORT_DIR, name), { recursive: true, force: true })
-  inContainer(['mkdir', '-p', `../export/${name}`])
-  inContainer(['document_exporter', `../export/${name}`, '--use-filename-format', '--no-progress-bar'])
-  const files = inContainer(['python3', '-c', ZIP_EXPORT, `../export/${name}`, `../export/${name}.zip`], { capture: true }).trim()
+  let files
+  if (PAPERLESS_MANAGE) {
+    execFileSync('mkdir', ['-p', join(EXPORT_DIR, name)])
+    manage(['document_exporter', `../export/${name}`, '--use-filename-format', '--no-progress-bar'])
+    files = execFileSync('python3', ['-c', ZIP_EXPORT, join(EXPORT_DIR, name), join(EXPORT_DIR, `${name}.zip`)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }).trim()
+  } else {
+    inContainer(['mkdir', '-p', `../export/${name}`])
+    inContainer(['document_exporter', `../export/${name}`, '--use-filename-format', '--no-progress-bar'])
+    files = inContainer(['python3', '-c', ZIP_EXPORT, `../export/${name}`, `../export/${name}.zip`], { capture: true }).trim()
+  }
   const zip = join(EXPORT_DIR, `${name}.zip`)
   if (!existsSync(zip)) fail(`export did not produce ${zip}`)
   log(`export: ${files} files, no duplicate names`)
@@ -326,7 +397,7 @@ async function providers() {
 }
 
 async function status() {
-  const s = synapse()
+  const s = await synapse()
   const fil = await s.payments.walletBalance({ token: TOKENS.FIL })
   const usdfc = await s.payments.walletBalance({ token: TOKENS.USDFC })
   const deposit = await s.payments.balance({ token: TOKENS.USDFC })
@@ -338,7 +409,7 @@ async function status() {
 }
 
 async function fund(months = 3) {
-  const s = synapse()
+  const s = await synapse()
   const contexts = await chosenContexts(s)
   const { costs, transaction } = await s.storage.prepare({
     context: contexts,
@@ -390,7 +461,7 @@ async function uploadWithRetry(s, chosen, bytes) {
 
 async function runBackup() {
   const chosen = await resolveProviders()
-  const s = synapse()
+  const s = await synapse()
   const backup = await encryptedExport()
   const { transaction } = await s.storage.prepare({ context: await chosenContexts(s), pieceSizes: [BigInt(backup.sealed.byteLength)] })
   if (transaction) fail(`account not funded for this upload (needs ${formatUnits(transaction.depositAmount)} USDFC); run: node backup.mjs fund`)
@@ -423,7 +494,7 @@ function list() {
 }
 
 async function verify() {
-  const s = synapse()
+  const s = await synapse()
   const live = readLedger().filter((e) => !e.deleted)
   let missing = 0
   const byDataSet = new Map()
@@ -446,7 +517,7 @@ async function restore(pieceCid, out) {
   const entry = readLedger().find((e) => e.pieceCid === pieceCid)
   let sealed
   try {
-    sealed = await synapse().storage.download({ pieceCid })
+    sealed = await (await synapse()).storage.download({ pieceCid })
   } catch (err) {
     // Without a wallet (restore on another machine) fall back to the providers' public piece URLs.
     const urls = entry?.copies.map((c) => c.retrievalUrl) ?? []
@@ -469,6 +540,7 @@ async function restore(pieceCid, out) {
 }
 
 async function prune(yes) {
+  if (process.env.SESSION_KEY_FILE) fail('pruning removes pieces, which a session key may not; run it with the wallet')
   const cutoff = Date.now() - config.keepWeeks * 7 * DAY
   const ledger = readLedger()
   const old = ledger.filter((e) => !e.deleted && Date.parse(e.date) < cutoff)
@@ -482,7 +554,7 @@ async function prune(yes) {
     log('pass --yes to delete (irreversible)')
     return []
   }
-  const s = synapse()
+  const s = await synapse()
   for (const e of old) {
     for (const c of e.copies) {
       const ctx = await s.storage.createContext({ dataSetId: BigInt(c.dataSetId) })
@@ -520,11 +592,7 @@ function paperlessFingerprint() {
     '  "labelIds": [m.objects.aggregate(m=Max("id"))["m"] for m in (Tag, Correspondent, DocumentType)],',
     '}))',
   ].join('\n')
-  const out = execFileSync('docker', ['compose', 'exec', '-T', '-u', 'paperless', PAPERLESS_SERVICE, 'python3', 'manage.py', 'shell', '-c', code], {
-    cwd: PAPERLESS,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'ignore'],
-  })
+  const out = manage(['shell', '-c', code], { capture: true, quiet: true })
   const line = out.trim().split('\n').reverse().find((l) => l.startsWith('{'))
   if (!line) fail('could not read the Paperless fingerprint (is Docker running?)')
   return line
@@ -540,7 +608,7 @@ function lastDueTime(now = new Date()) {
 }
 
 async function accountSummary() {
-  const s = synapse()
+  const s = await synapse()
   const fil = await s.payments.walletBalance({ token: TOKENS.FIL })
   const usdfc = await s.payments.walletBalance({ token: TOKENS.USDFC })
   const info = await s.payments.accountInfo({ token: TOKENS.USDFC })
@@ -835,6 +903,8 @@ const commands = {
   'mail-preview': mailPreview,
   restore: () => restore(args[0], args[1]),
   prune: () => prune(args.includes('--yes')),
+  'session-login': () => sessionLogin(Number(args[0]), args[1]),
+  'session-revoke': () => sessionRevoke(args[0]),
 }
 try {
   if (!commands[command]) fail(`unknown command. One of: ${Object.keys(commands).join(', ')}`)
