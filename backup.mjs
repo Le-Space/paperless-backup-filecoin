@@ -291,18 +291,31 @@ async function resolveProviders() {
 // thumbnail then overwrites another's on restore. The zip is made afterwards,
 // with the same layout (manifest.json at the top), and refused if any name
 // still occurs twice.
+//
+// EXPORT_EXTRA_DIR (optional): a directory that goes into the zip as well,
+// under .paperless-anywhere/, beside the export. The confidential guest puts
+// its TLS certificate there, so a restore brings the same certificate back
+// instead of asking the CA again. document_importer never sees it: the
+// restore takes it out before the import.
+const EXPORT_EXTRA_DIR = process.env.EXPORT_EXTRA_DIR
 const ZIP_EXPORT = `
 import os, shutil, sys, zipfile
 src, out = sys.argv[1], sys.argv[2]
+extra = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
 names = []
 with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as z:
-    for root, dirs, files in os.walk(src):
-        dirs.sort()
-        for f in sorted(files):
-            path = os.path.join(root, f)
-            name = os.path.relpath(path, src)
-            names.append(name)
-            z.write(path, name)
+    for base, prefix in ((src, ''), (extra, '.paperless-anywhere')):
+        if base is None or not os.path.isdir(base):
+            continue
+        for root, dirs, files in os.walk(base):
+            dirs.sort()
+            for f in sorted(files):
+                path = os.path.join(root, f)
+                if os.path.islink(path):
+                    continue
+                name = os.path.join(prefix, os.path.relpath(path, base)) if prefix else os.path.relpath(path, base)
+                names.append(name)
+                z.write(path, name)
 shutil.rmtree(src)
 dupes = len(names) - len(set(names))
 if dupes or 'manifest.json' not in names:
@@ -335,7 +348,7 @@ function exportPaperless(name) {
   if (PAPERLESS_MANAGE) {
     execFileSync('mkdir', ['-p', join(EXPORT_DIR, name)])
     manage(['document_exporter', `../export/${name}`, '--use-filename-format', '--no-progress-bar'])
-    files = execFileSync('python3', ['-c', ZIP_EXPORT, join(EXPORT_DIR, name), join(EXPORT_DIR, `${name}.zip`)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }).trim()
+    files = execFileSync('python3', ['-c', ZIP_EXPORT, join(EXPORT_DIR, name), join(EXPORT_DIR, `${name}.zip`), EXPORT_EXTRA_DIR ?? ''], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }).trim()
   } else {
     inContainer(['mkdir', '-p', `../export/${name}`])
     inContainer(['document_exporter', `../export/${name}`, '--use-filename-format', '--no-progress-bar'])
