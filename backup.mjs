@@ -70,12 +70,20 @@ const DAY = 24 * 60 * 60 * 1000
 const HOUR = 60 * 60 * 1000
 
 // The whole cause chain: the SDK wraps the provider's answer two levels deep.
+// One line: each error in the cause chain with what the provider answered.
+// Synapse errors keep the provider's decoded answer in `details` (and
+// shortMessage without it); an HTTP error has `status`.
 function describeError(err) {
   const parts = []
+  const add = (text) => {
+    const line = String(text ?? '').replace(/\s+/g, ' ').trim()
+    if (line && !parts.some((p) => p.includes(line))) parts.push(line)
+  }
   for (let e = err, i = 0; e && i < 6; e = e.cause, i++) {
-    const text = e.shortMessage ?? e.message ?? String(e)
-    if (!parts.includes(text)) parts.push(text)
-    if (e.status) parts.push(`HTTP ${e.status}`)
+    add(e.shortMessage ?? e.message ?? String(e))
+    // details copied from the cause come again one step down.
+    if (e.details && e.details !== e.cause?.message) add(`provider says: ${e.details}`)
+    if (e.status) add(`HTTP ${e.status}${e.statusText ? ` ${e.statusText}` : ''}`)
   }
   return parts.join(' <- ')
 }
@@ -961,6 +969,8 @@ try {
   if (!commands[command]) fail(`unknown command. One of: ${Object.keys(commands).join(', ')}`)
   await commands[command]()
 } catch (err) {
-  console.error(`error: ${err instanceof Failure ? err.message : (err.stack ?? err.message)}`)
+  // The cause chain on the error line (what the VM shows); the stack only with DEBUG.
+  console.error(`error: ${err instanceof Failure ? err.message : describeError(err)}`)
+  if (process.env.DEBUG && !(err instanceof Failure) && err.stack) console.error(err.stack)
   process.exit(1)
 }
