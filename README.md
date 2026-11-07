@@ -42,7 +42,7 @@ On 2026-10-05, with a Paperless archive of about 1,000 documents, on Filecoin's 
 | `restore` | downloaded and decrypted in under 3 minutes; SHA-256 identical to the original export, zip intact with its manifest |
 
 What it taught, now in the script:
-- A first attempt failed because the primary provider stopped answering after the upload. `run` now retries with the next chosen provider as primary — the set of providers, and so the region, stays the same.
+- A first attempt failed because the primary provider stopped answering after the upload. `run` now retries without it, with the next chosen provider as primary: one provider that refuses the piece costs a copy, not the backup. Such a backup is marked incomplete; the next run asks every chosen provider again, and no provider outside the chosen set (and region) is added.
 - The Mac's clock was an hour slow, and the deposit was refused (`EIP2612: expired deadline`): the permit had expired by chain time. Keep the system clock synced.
 
 Try it yourself for free: [HOWTO.txt](HOWTO.txt), step 5. What every command prints on a good run, and what the common errors mean: [HOWTO.txt](HOWTO.txt), step 11.

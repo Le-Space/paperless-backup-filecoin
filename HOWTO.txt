@@ -317,9 +317,13 @@ run - export, encrypt, upload (minutes, depending on size and uplink):
     2026-10-05T10:14:46.855Z uploading 631848030 bytes to providers 36, 37, 1 (primary 36) …
     2026-10-05T10:24:03.413Z piece bafkzcib…: 3/3 copies
 
-  If a provider does not answer, you see a retry with the next one first:
+  If a provider does not answer, the upload goes on without it, with the next
+  one first; the backup then has a copy less and counts as incomplete (the
+  next run asks all providers again):
     … upload with primary 36 failed: Failed to store piece on service provider 36 (…)
-    … uploading 631848030 bytes to providers 37, 1, 36 (primary 37) …
+    … uploading 631848030 bytes to providers 37, 1 (primary 37) …
+    … WARNING: without provider(s) 36: 2 of 3 copies
+    … piece bafkzcib…: 2/3 copies (INCOMPLETE)
 
 verify - every copy in its data set:
 
