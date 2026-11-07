@@ -477,21 +477,30 @@ async function plan() {
 }
 
 // The primary copy is the one this machine uploads; the others pull from it.
-// A primary that stops answering fails the whole upload, so each retry puts
-// the next chosen provider first. The set of providers never changes.
+// A primary that fails fails the whole upload (a secondary that fails only
+// leaves a copy short), so each retry goes on without the provider that just
+// failed as primary: one provider that refuses the piece costs one copy, not
+// the backup. The result says how many copies the config asked for, so a
+// backup that lost one is marked incomplete and the next run tries all again.
 async function uploadWithRetry(s, chosen, backup) {
   let lastError
-  for (let attempt = 0; attempt < chosen.length; attempt++) {
-    const order = [...chosen.slice(attempt), ...chosen.slice(0, attempt)]
+  let order = [...chosen]
+  const refused = []
+  while (order.length) {
     const contexts = await s.storage.createContexts({ providerIds: order.map((p) => BigInt(p.id)), metadata: config.datasetMetadata })
     log(`uploading ${backup.sealedBytes} bytes to providers ${order.map((p) => p.id).join(', ')} (primary ${order[0].id}) …`)
     try {
       // A fresh stream from the encrypted file for every attempt.
-      return await s.storage.upload(fileStream(backup.sealedPath), { contexts })
+      const result = await s.storage.upload(fileStream(backup.sealedPath), { contexts })
+      if (!refused.length) return result
+      log(`WARNING: without provider(s) ${refused.map((r) => r.providerId).join(', ')}: ${result.copies.length} of ${chosen.length} copies`)
+      return { ...result, requestedCopies: chosen.length, complete: result.copies.length >= chosen.length, failedAttempts: [...refused, ...(result.failedAttempts ?? [])] }
     } catch (err) {
       lastError = err
       log(`upload with primary ${order[0].id} failed: ${describeError(err)}`)
-      if (attempt + 1 < chosen.length) await new Promise((r) => setTimeout(r, 30_000))
+      refused.push({ providerId: order[0].id, role: 'primary', error: describeError(err).slice(0, 300) })
+      order = order.slice(1)
+      if (order.length) await new Promise((r) => setTimeout(r, 30_000))
     }
   }
   throw lastError
