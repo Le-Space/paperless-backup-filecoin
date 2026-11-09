@@ -10,6 +10,9 @@
 // machine that holds it can back up within the wallet's deposit, and cannot
 // delete pieces, end storage or move funds. PAPERLESS_MANAGE names a command
 // that runs manage.py where `docker compose exec` does not work.
+// With config.remoteSigner and BACKUP_KEY_FILE (remote-signer mode) this machine
+// holds no payer and no session key: Le Space Credits checks each step and has
+// the treasury's session key sign it; the backup key only signs the request.
 //
 //   node backup.mjs init-key        create the age identity (once)
 //   node backup.mjs providers       approved providers, their location, region check
@@ -42,9 +45,11 @@ import { getPDPProvidersByIds } from '@filoz/synapse-core/sp-registry'
 import { getApprovedProviderIds } from '@filoz/synapse-core/warm-storage'
 import { getEndorsedProviderIds } from '@filoz/synapse-core/endorsements'
 import * as SessionKey from '@filoz/synapse-core/session-key'
-import { createPublicClient, createWalletClient, http } from 'viem'
+import { createClient, createPublicClient, createWalletClient, http } from 'viem'
+import { getTransport } from '@filoz/synapse-core/client'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import nodemailer from 'nodemailer'
+import { backupMetadata, checkConfig, createRemoteSigner, isOwnDataSet, parseBackupKey, payerAccount } from './remote-signer.mjs'
 import { Agent, setGlobalDispatcher } from 'undici'
 
 // A provider answers an upload only after it has hashed the whole piece, which
@@ -83,7 +88,7 @@ function describeError(err) {
     add(e.shortMessage ?? e.message ?? String(e))
     // details copied from the cause come again one step down.
     if (e.details && e.details !== e.cause?.message) add(`provider says: ${e.details}`)
-    if (e.status) add(`HTTP ${e.status}${e.statusText ? ` ${e.statusText}` : ''}`)
+    if (e.status && !(e.code && e.name === 'RemoteSignerError')) add(`HTTP ${e.status}${e.statusText ? ` ${e.statusText}` : ''}`)
   }
   return parts.join(' <- ')
 }
@@ -97,6 +102,22 @@ const chain = config.network === 'calibration' ? calibration : mainnet
 // Testnet backups get their own ledger, so they never mix with real ones.
 const LEDGER_PATH = join(HERE, config.network === 'calibration' ? 'ledger.calibration.json' : 'ledger.json')
 const STATE_PATH = join(HERE, config.network === 'calibration' ? 'state.calibration.json' : 'state.json')
+// Remote-signer mode: config.remoteSigner plus a backup key in BACKUP_KEY_FILE.
+let REMOTE = null
+try {
+  REMOTE = config.remoteSigner ? checkConfig(config.remoteSigner) : null
+} catch (err) {
+  console.error(`error: ${err.message}`)
+  process.exit(1)
+}
+if (REMOTE && !process.env.BACKUP_KEY_FILE) {
+  console.error('error: config.remoteSigner needs BACKUP_KEY_FILE (the backup key, 0x hex)')
+  process.exit(1)
+}
+if (REMOTE && process.env.SESSION_KEY_FILE) {
+  console.error('error: remote-signer mode replaces SESSION_KEY_FILE; unset it')
+  process.exit(1)
+}
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args)
@@ -163,6 +184,25 @@ const jsonable = (value) => JSON.parse(JSON.stringify(value, (_, v) => (typeof v
 const SESSION_PERMISSIONS = [SessionKey.CreateDataSetPermission, SessionKey.AddPiecesPermission]
 
 async function synapse() {
+  if (REMOTE) {
+    const transport = getTransport(chain)
+    const sessionAccount = createRemoteSigner({
+      chain,
+      creditsUrl: REMOTE.creditsUrl,
+      product: REMOTE.product,
+      account: REMOTE.account,
+      signer: REMOTE.signer,
+      payer: REMOTE.payer,
+      backupKey: parseBackupKey(readFileSync(process.env.BACKUP_KEY_FILE, 'utf8')),
+    })
+    // The payer is the treasury: synapse names it in every step's extraData
+    // and looks up its data sets; it never signs here.
+    const client = createClient({ chain, transport, account: payerAccount(REMOTE.payer), name: 'Synapse Client', key: 'synapse-client' })
+    const sessionClient = createClient({ chain, transport, account: sessionAccount, name: 'Remote signer', key: 'remote-signer' })
+    // No source and no CDN: the service signs only app, customer (and withIPFSIndexing).
+    const s = new Synapse({ client, sessionClient, source: null, withCDN: false })
+    return Object.assign(s, { address: REMOTE.payer, sessionAddress: REMOTE.signer, backupAddress: sessionAccount.backupAddress })
+  }
   const sessionFile = process.env.SESSION_KEY_FILE
   if (sessionFile) {
     const root = config.payer ?? process.env.PAYER_ADDRESS
@@ -207,9 +247,23 @@ async function sessionRevoke(address) {
   log(`session key ${address} revoked`)
 }
 
+// The data sets' metadata. In remote-signer mode only what the service signs:
+// app = label, customer = tag, and withIPFSIndexing if the config asks for it.
+function datasetMetadata() {
+  if (!REMOTE) return config.datasetMetadata
+  return backupMetadata({ label: REMOTE.label, tag: REMOTE.tag, withIPFSIndexing: config.datasetMetadata && 'withIPFSIndexing' in config.datasetMetadata })
+}
+
 async function chosenContexts(s) {
   const ids = (await resolveProviders()).map((p) => BigInt(p.id))
-  return s.storage.createContexts({ providerIds: ids, metadata: config.datasetMetadata })
+  return s.storage.createContexts({ providerIds: ids, metadata: datasetMetadata() })
+}
+
+// Remote-signer mode: this account's data sets are the payer's whose metadata
+// names this backup (app = label, customer = tag).
+async function ownDataSets(s) {
+  const all = await s.storage.findDataSets({ address: REMOTE.payer })
+  return all.filter((ds) => ds.isLive && isOwnDataSet(ds, REMOTE))
 }
 
 function regionCodes() {
@@ -270,10 +324,12 @@ async function resolveProviders() {
       else if (!p.active) problems.push(`provider ${id} (${p.name}) is not active`)
       else if (!inRegion(p)) problems.push(`provider ${id} (${p.name}) declares ${p.location || 'no location'}, outside the configured regions`)
     }
+    if (REMOTE && config.providerIds.length > 3) problems.push('remote-signer mode: at most 3 providers (the service signs at most 3 data sets per account)')
     if (problems.length) fail(problems.join('\n'))
     resolved = config.providerIds.map((id) => byId.get(id))
   } else {
     const copies = config.copies ?? 2
+    if (REMOTE && copies > 3) fail('remote-signer mode: at most 3 copies (the service signs at most 3 data sets per account)')
     const candidates = approved.filter((p) => p.active && inRegion(p)).sort((a, b) => b.endorsed - a.endorsed || a.id - b.id)
     if (candidates.length < copies) fail(`${copies} copies wanted, but only ${candidates.length} approved provider(s) in the regions: ${candidates.map((p) => p.id).join(', ') || 'none'}`)
     // One copy per operator first (operator = the provider's domain), then per
@@ -438,6 +494,14 @@ async function providers() {
 
 async function status() {
   const s = await synapse()
+  if (REMOTE) {
+    log(`network ${chain.name}, remote signer ${REMOTE.creditsUrl} (product ${REMOTE.product})`)
+    log(`account ${REMOTE.account}, backup key ${s.backupAddress}, signer ${REMOTE.signer}, payer ${REMOTE.payer}`)
+    const mine = await ownDataSets(s)
+    log(`data sets of this backup (${REMOTE.label}): ${mine.map((d) => `${d.pdpVerifierDataSetId} (provider ${d.providerId})`).join(', ') || 'none yet'}`)
+    log(`providers ${(await resolveProviders()).map((p) => p.id).join(', ')}; the service checks paid time and quota on each step`)
+    return
+  }
   const fil = await s.payments.walletBalance({ token: TOKENS.FIL })
   const usdfc = await s.payments.walletBalance({ token: TOKENS.USDFC })
   const deposit = await s.payments.balance({ token: TOKENS.USDFC })
@@ -449,6 +513,7 @@ async function status() {
 }
 
 async function fund(months = 3) {
+  if (REMOTE) fail('remote-signer mode: Le Space pays the storage; buy backup months in the app')
   const s = await synapse()
   const contexts = await chosenContexts(s)
   const { costs, transaction } = await s.storage.prepare({
@@ -495,7 +560,7 @@ async function uploadWithRetry(s, chosen, backup) {
   let order = [...chosen]
   const refused = []
   while (order.length) {
-    const contexts = await s.storage.createContexts({ providerIds: order.map((p) => BigInt(p.id)), metadata: config.datasetMetadata })
+    const contexts = await s.storage.createContexts({ providerIds: order.map((p) => BigInt(p.id)), metadata: datasetMetadata() })
     log(`uploading ${backup.sealedBytes} bytes to providers ${order.map((p) => p.id).join(', ')} (primary ${order[0].id}) …`)
     try {
       // A fresh stream from the encrypted file for every attempt.
@@ -520,6 +585,7 @@ async function runBackup() {
   const backup = await encryptedExport()
   try {
     const { transaction } = await s.storage.prepare({ context: await chosenContexts(s), pieceSizes: [BigInt(backup.sealedBytes)] })
+    if (transaction && REMOTE) fail('the Le Space payer is not funded for this upload; tell Le Space (nothing was signed)')
     if (transaction) fail(`account not funded for this upload (needs ${formatUnits(transaction.depositAmount)} USDFC); run: node backup.mjs fund`)
 
     const result = await uploadWithRetry(s, chosen, backup)
@@ -545,10 +611,18 @@ async function runBackup() {
   }
 }
 
-function list() {
+async function list() {
   for (const e of readLedger()) {
     const where = e.copies.map((c) => `${c.providerId}@${(c.location ?? '').replace(/;.*$/, '')}`).join(' ')
     console.log([e.date.slice(0, 10), e.deleted ? 'deleted' : e.complete ? 'complete' : 'partial', e.pieceCid, `${(e.size / 2 ** 20).toFixed(0)} MiB`, where].join(' | '))
+  }
+  // Remote-signer mode: what the chain holds for this backup, also without a
+  // ledger (a new VM restoring).
+  if (!REMOTE) return
+  const s = await synapse()
+  for (const ds of await ownDataSets(s)) {
+    const ctx = await s.storage.createContext({ dataSetId: ds.pdpVerifierDataSetId })
+    for await (const piece of ctx.getPieces()) console.log(['chain', `data set ${ds.pdpVerifierDataSetId}`, `provider ${ds.providerId}`, `piece ${piece.pieceId}`, piece.pieceCid.toString()].join(' | '))
   }
 }
 
@@ -558,7 +632,13 @@ async function verify() {
   let missing = 0
   const byDataSet = new Map()
   for (const e of live) for (const c of e.copies) byDataSet.set(c.dataSetId, [...(byDataSet.get(c.dataSetId) ?? []), e.pieceCid])
+  const own = REMOTE ? new Set((await ownDataSets(s)).map((d) => String(d.pdpVerifierDataSetId))) : null
   for (const [dataSetId, expected] of byDataSet) {
+    if (own && !own.has(String(dataSetId))) {
+      for (const cid of expected) log(`MISSING data set ${dataSetId} is not (or no longer) a data set of this backup ${cid}`)
+      missing += expected.length
+      continue
+    }
     const ctx = await s.storage.createContext({ dataSetId: BigInt(dataSetId) })
     const present = new Set()
     for await (const piece of ctx.getPieces()) present.add(piece.pieceCid.toString())
@@ -599,7 +679,7 @@ async function restore(pieceCid, out) {
 }
 
 async function prune(yes) {
-  if (process.env.SESSION_KEY_FILE) fail('pruning removes pieces, which a session key may not; run it with the wallet')
+  if (process.env.SESSION_KEY_FILE && !REMOTE) fail('pruning removes pieces, which a session key may not; run it with the wallet')
   const cutoff = Date.now() - config.keepWeeks * 7 * DAY
   const ledger = readLedger()
   const old = ledger.filter((e) => !e.deleted && Date.parse(e.date) < cutoff)
@@ -614,8 +694,15 @@ async function prune(yes) {
     return []
   }
   const s = await synapse()
+  // Remote-signer mode: removals go through the service (SchedulePieceRemovals),
+  // only in this backup's data sets; no data set is ever terminated.
+  const own = REMOTE ? new Set((await ownDataSets(s)).map((d) => String(d.pdpVerifierDataSetId))) : null
   for (const e of old) {
     for (const c of e.copies) {
+      if (own && !own.has(String(c.dataSetId))) {
+        log(`skipping data set ${c.dataSetId}: not a data set of this backup`)
+        continue
+      }
       const ctx = await s.storage.createContext({ dataSetId: BigInt(c.dataSetId) })
       await ctx.deletePiece({ piece: BigInt(c.pieceId) })
     }
@@ -667,6 +754,9 @@ function lastDueTime(now = new Date()) {
 }
 
 async function accountSummary() {
+  // Remote-signer mode: the payer is Le Space's, its balance is not this
+  // customer's business, and there is nothing to top up here.
+  if (REMOTE) return null
   const s = await synapse()
   const fil = await s.payments.walletBalance({ token: TOKENS.FIL })
   const usdfc = await s.payments.walletBalance({ token: TOKENS.USDFC })
@@ -746,7 +836,7 @@ async function mailCheck() {
 // --warning simulates a deposit that lasts 12 more days, to see the warning mail.
 async function mailTest(warning) {
   const account = await accountSummary()
-  const report = { kind: 'test', lastUpload: readLedger().filter((e) => e.complete && !e.deleted).at(-1), account: warning ? { ...account, runwayDays: 12 } : account }
+  const report = { kind: 'test', lastUpload: readLedger().filter((e) => e.complete && !e.deleted).at(-1), account: warning && account ? { ...account, runwayDays: 12 } : account }
   const mail = renderReport(report)
   await sendMail(`${warning ? '[TEST] ' : ''}${mail.subject}`, mail.text, mail)
 }
@@ -757,7 +847,7 @@ async function mailPreview() {
   const lastUpload = readLedger().filter((e) => e.complete && !e.deleted).at(-1)
   const cases = [
     { kind: 'test', lastUpload, account },
-    { kind: 'unchanged', lastUpload, account: { ...account, runwayDays: 12, fil: 0.01 } },
+    { kind: 'unchanged', lastUpload, account: account && { ...account, runwayDays: 12, fil: 0.01 } },
     { kind: 'failed', error: 'could not read the Paperless fingerprint (is Docker running?)', account },
   ]
   for (const r of cases) {
@@ -919,7 +1009,7 @@ async function daily() {
       if (report.kind === 'incomplete') process.exitCode = 2
     }
     report.account = await accountSummary()
-    log(`account: ${report.account.fil} FIL, ${report.account.usdfc} USDFC, ${report.account.available} USDFC available, runway ${report.account.runwayDays} days`)
+    if (report.account) log(`account: ${report.account.fil} FIL, ${report.account.usdfc} USDFC, ${report.account.available} USDFC available, runway ${report.account.runwayDays} days`)
     writeState({ ...state, lastDaily: new Date().toISOString(), lastFingerprint: fingerprint, failures: 0, lastFailureAt: undefined })
     const mail = renderReport(report)
     await sendMail(mail.subject, mail.text, mail)

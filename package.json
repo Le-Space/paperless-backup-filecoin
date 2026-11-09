@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "description": "Encrypted Paperless backup to Filecoin Onchain Cloud",
   "scripts": {
-    "backup": "node backup.mjs run"
+    "backup": "node backup.mjs run",
+    "test": "node --test test/*.test.mjs"
   },
   "keywords": [
     "paperless-ngx",
