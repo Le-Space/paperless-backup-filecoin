@@ -86,8 +86,9 @@ Step-by-step setup: [HOWTO.txt](HOWTO.txt). Auf Deutsch: [ANLEITUNG.txt](ANLEITU
 | `mail` | SMTP `host`, `port`, `user`, `from`, `to`, and `language` (`en` or `de`) for the daily report; password in the keychain (`paperless-backup-smtp`) or `SMTP_PASSWORD_FILE` |
 | `network` | `mainnet` or `calibration` (testnet) |
 | `payer` | the wallet address a session key acts for (or `PAYER_ADDRESS`) |
+| `remoteSigner` | remote-signer mode, see below: `creditsUrl`, `product`, `account`, `payer`, `signer`, `tag`, `label` |
 
-Environment: `PAPERLESS_DIR` (default: the parent folder), `PAPERLESS_SERVICE` (default `webserver`), `BACKUP_CONFIG`, `WALLET_KEY_FILE`, `AGE_IDENTITY_FILE`, `SMTP_PASSWORD_FILE`, `SESSION_KEY_FILE`, `PAYER_ADDRESS`, `PAPERLESS_MANAGE` (a command that takes `manage.py`'s arguments, where `docker compose exec` does not work).
+Environment: `PAPERLESS_DIR` (default: the parent folder), `PAPERLESS_SERVICE` (default `webserver`), `BACKUP_CONFIG`, `WALLET_KEY_FILE`, `AGE_IDENTITY_FILE`, `SMTP_PASSWORD_FILE`, `SESSION_KEY_FILE`, `PAYER_ADDRESS`, `BACKUP_KEY_FILE` (remote-signer mode), `PAPERLESS_MANAGE` (a command that takes `manage.py`'s arguments, where `docker compose exec` does not work).
 
 ## Backing up from a machine that must not hold the wallet
 
@@ -96,6 +97,47 @@ A machine that runs Paperless only for a while, a rented VM for example, can bac
 1. With the wallet, create a session key: `node backup.mjs session-login 8 session.key`. It may **create data sets and add pieces** until it expires, and nothing else. It cannot delete pieces, end storage or move funds. Storage is paid from the wallet's deposit in Filecoin Pay, so an operator approval with low limits caps what a session key can spend.
 2. On the machine, set `SESSION_KEY_FILE` to that key and `payer` in `config.json` to the wallet address, then run `run` or `daily`. It does not need the age identity: backups are encrypted to `ageRecipient`, the public half. `prune` refuses there.
 3. When the machine is done, `node backup.mjs session-revoke <address>` withdraws the key; otherwise it expires.
+
+## Remote signer: backups paid with Le Space Credits
+
+In this mode the machine holds **no payer and no session key**. Le Space pays the storage of every customer from one payer; a session key of that payer (the *signer*) signs each backup step, but only after Le Space Credits has checked it: that the backup is paid for, that the data set belongs to the account, that the provider is approved, the number of copies and the quota. The machine holds only a **backup key**, which signs its requests to the service.
+
+It is on when `config.json` has `remoteSigner` and `BACKUP_KEY_FILE` names a file with the backup key (`0x` + 64 hex digits, readable only by the backup's user). It replaces `SESSION_KEY_FILE`; setting both is refused.
+
+```json
+"remoteSigner": {
+  "creditsUrl": "https://credits.example.com",
+  "product": "paperless-anywhere",
+  "account": "0x00000000000000000000000000000000000000aa",
+  "payer": "0x00000000000000000000000000000000000000cc",
+  "signer": "0x00000000000000000000000000000000000000bb",
+  "tag": "0123456789abcdef0123456789abcdef",
+  "label": "paperless-backup"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `creditsUrl` | the Le Space Credits service (https); steps are signed at `POST {creditsUrl}/v1/backup/sign` |
+| `product` | the product the account bought backup months for |
+| `account` | the customer's ledger address at the service |
+| `payer` | the Le Space payer: owner of the data sets, named in every step's extraData |
+| `signer` | the payer's session key that the service signs with; an answer from any other key is refused |
+| `tag` | the account's tag (32 hex digits): data-set metadata `customer` |
+| `label` | data-set metadata `app` (the service's label for the product and network) |
+
+How it works:
+
+- For each step synapse asks to sign (`CreateDataSet`, `AddPieces`, `SchedulePieceRemovals`), the tool computes the EIP-712 digest with synapse-core's storage domain and types, signs `ls-backup-sign/v1\n<product>\n<account, lowercase>\n<unix seconds>\n<digest>` with the backup key (EIP-191), and posts `{product, account, kind, message, timestamp, signature}` (numbers as decimal strings). It accepts the answer only if its `digest` is the local one and the signature is by `signer` for `payer`. The signer signs typed data and nothing else; requests go one at a time, one per second.
+- Data sets carry only `app` = `label` and `customer` = `tag` (plus `withIPFSIndexing` if `datasetMetadata` has it). Never `withCDN`, no `source`. `datasetMetadata` is otherwise ignored.
+- At most 3 copies (`copies` or `providerIds`): the service signs at most 3 data sets per account.
+- `list` also shows the pieces on chain in this account's data sets (the payer's data sets whose metadata is this `label` and `tag`), so a new machine without the ledger sees what there is. `verify` and `prune` touch only those data sets.
+- `prune` works: it schedules piece removals through the service, which signs them even when no backup is paid. No data set is ever terminated.
+- `fund` refuses, `status` shows the mode and the data sets, and the daily mail has no account section: the payer is not the customer's.
+
+Refusals of the service end the step with the code, the service's message and a hint, e.g. `remote signer refused CreateDataSet: NO_BACKUP (HTTP 409) no backup paid for now – …`. Codes: `SIGNATURE`, `REPLAY`, `STALE` (401), `NO_BACKUP`, `COPIES`, `QUOTA` (409), `METADATA`, `PROVIDER` (400), `DATA_SET` (403), `TERMS` (412).
+
+Tests: `npm test` runs the remote signer against a mocked service that checks each request as Le Space Credits does.
 
 ## Limits — read before relying on it
 
