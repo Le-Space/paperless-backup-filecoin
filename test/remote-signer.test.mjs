@@ -14,7 +14,9 @@ import { privateKeyToAccount, signTypedData } from 'viem/accounts'
 import { calibration } from '@filoz/synapse-core/chains'
 import * as Piece from '@filoz/synapse-core/piece'
 import { EIP712Types, getStorageDomain, signAddPieces, signCreateDataSet, signCreateDataSetAbiParameters, signSchedulePieceRemovals } from '@filoz/synapse-core/typed-data'
-import { backupMetadata, checkConfig, createRemoteSigner, digestOf, isOwnDataSet, signLine } from '../remote-signer.mjs'
+import { Synapse } from '@filoz/synapse-sdk'
+import { StorageContext } from '@filoz/synapse-sdk/storage'
+import { backupMetadata, checkConfig, createRemoteSigner, dataSetState, digestOf, isOwnDataSet, ownDataSetsOf, payerAccount, signLine } from '../remote-signer.mjs'
 
 const PRODUCT = 'paperless-anywhere'
 const ACCOUNT = '0x00000000000000000000000000000000000000aa'
@@ -91,6 +93,7 @@ function mockService({ now }) {
     seen: new Set(),
     requests: [],
     tamper: null, // 'digest' | 'signer' | 'payer'
+    ended: new Set(), // client data set ids an operator terminated
   }
   async function sign(r) {
     if (r.product !== PRODUCT) throw new Refusal('this product sells no backup', 409, 'NO_BACKUP')
@@ -113,11 +116,12 @@ function mockService({ now }) {
       if (!state.terms) throw new Refusal('terms not accepted', 412, 'TERMS')
       if (!state.paid) throw new Refusal('no backup paid for now', 409, 'NO_BACKUP')
     }
+    if (kind !== 'SchedulePieceRemovals' && own(message.clientDataSetId) && state.ended.has(message.clientDataSetId.toString())) throw new Refusal('data set was ended', 409, 'ENDED')
     if (kind === 'CreateDataSet') {
       const meta = new Map(message.metadata.map((e) => [e.key, e.value]))
       if (meta.size !== message.metadata.length || [...meta.keys()].some((k) => !['app', 'customer', 'withIPFSIndexing'].includes(k))) throw new Refusal('metadata has unknown or repeated keys', 400, 'METADATA')
       if (meta.get('app') !== LABEL || meta.get('customer') !== TAG) throw new Refusal('metadata does not name this backup', 400, 'METADATA')
-      if (!own(message.clientDataSetId) && state.dataSets.length >= 3) throw new Refusal('at most 3 data sets', 409, 'COPIES')
+      if (!own(message.clientDataSetId) && state.dataSets.filter((id) => !state.ended.has(id)).length >= 3) throw new Refusal('at most 3 data sets', 409, 'COPIES')
       if (message.payee !== PROVIDER.toLowerCase()) throw new Refusal('payee is not an approved provider', 400, 'PROVIDER')
       if (!own(message.clientDataSetId)) state.dataSets.push(message.clientDataSetId.toString())
     } else {
@@ -171,7 +175,7 @@ before(async () => {
 })
 after(() => new Promise((r) => service.server.close(r)))
 beforeEach(() => {
-  Object.assign(service.state, { paid: true, terms: true, dataSets: [], stored: new Map(), seen: new Set(), requests: [], tamper: null })
+  Object.assign(service.state, { paid: true, terms: true, dataSets: [], stored: new Map(), seen: new Set(), requests: [], tamper: null, ended: new Set() })
 })
 
 // The VM's clock moves a second per request, so tests need not wait.
@@ -304,5 +308,77 @@ describe('config and data sets', () => {
     assert.ok(isOwnDataSet({ metadata: { app: LABEL, customer: TAG } }, { label: LABEL, tag: TAG }))
     assert.ok(!isOwnDataSet({ metadata: { app: LABEL, customer: 'f'.repeat(32) } }, { label: LABEL, tag: TAG }))
     assert.ok(!isOwnDataSet({ metadata: { app: 'paperless-backup', customer: TAG } }, { label: LABEL, tag: TAG }))
+  })
+})
+
+describe('a data set Le Space ended', () => {
+  // The payer's data sets as FWSS lists them (made up): an ended one of this
+  // backup, another customer's, and nothing else at provider 1.
+  const ENDED_ID = 5n
+  const payerDataSets = [
+    { dataSetId: ENDED_ID, clientDataSetId: 41n, providerId: 1n, pdpEndEpoch: 3_000_000n, metadata: { app: LABEL, customer: TAG } },
+    { dataSetId: 6n, clientDataSetId: 42n, providerId: 1n, pdpEndEpoch: 0n, metadata: { app: LABEL, customer: 'f'.repeat(32) } },
+  ]
+  const provider = { id: 1n, serviceProvider: PROVIDER, pdp: { serviceURL: 'https://sp.example.com' } }
+  const warmStorage = (sets) => ({
+    getClientDataSets: async () => ({ items: sets, nextCursor: null }),
+    getDataSetMetadata: async ({ dataSetId }) => sets.find((d) => d.dataSetId === dataSetId).metadata,
+    hasActivePieces: async () => true,
+  })
+  const spRegistry = { getProvider: async () => provider }
+  const resolve = (sets) => StorageContext.resolveByProviderId(PAYER, 1n, backupMetadata({ label: LABEL, tag: TAG }), warmStorage(sets), spRegistry, 0n)
+
+  it('is shown as ended, with its end epoch as a date, and kept apart from live ones', () => {
+    const own = ownDataSetsOf(
+      [...payerDataSets, { dataSetId: 7n, providerId: 2n, pdpEndEpoch: 0n }].map((d) => ({ ...d, isLive: true, pdpVerifierDataSetId: d.dataSetId })),
+      { label: LABEL, tag: TAG, chain },
+    )
+    assert.deepEqual(own.map((d) => d.pdpVerifierDataSetId), [ENDED_ID])
+    assert.equal(own[0].ended.epoch, 3_000_000n)
+    assert.equal(own[0].ended.date.getTime(), (chain.genesisTimestamp + 3_000_000 * 30) * 1000)
+    assert.match(dataSetState(own[0]), /^ended \d{4}-\d{2}-\d{2} \(epoch 3000000\)$/)
+    assert.equal(dataSetState({ ended: null }), 'live')
+  })
+
+  it('is never picked for an upload: synapse resolves the provider to a new data set', async () => {
+    const resolution = await resolve(payerDataSets)
+    assert.equal(resolution.dataSetId, null, 'no data set reused')
+    assert.deepEqual(resolution.dataSetMetadata, { app: LABEL, customer: TAG })
+    // Control: the same data set before it ended is reused.
+    const live = await resolve([{ ...payerDataSets[0], pdpEndEpoch: 0n }, payerDataSets[1]])
+    assert.equal(live.dataSetId, ENDED_ID)
+  })
+
+  it('the upload then signs a new data set with a new clientDataSetId', async () => {
+    service.state.dataSets.push('41')
+    service.state.ended.add('41')
+    const transport = http('http://127.0.0.1:9')
+    const synapse = new Synapse({
+      client: createClient({ chain, transport, account: payerAccount(PAYER) }),
+      sessionClient: createClient({ chain, transport, account: remote() }),
+      source: null,
+      withCDN: false,
+      pieceBatching: false,
+    })
+    const context = await StorageContext.createWithSelectedProvider(await resolve(payerDataSets), synapse, warmStorage(payerDataSets))
+    assert.equal(context.dataSetId, undefined)
+    await context.presignForCommit([{ pieceCid: await pieceCid() }])
+    const [create, add] = service.state.requests
+    assert.equal(create.kind, 'CreateDataSet')
+    assert.notEqual(create.message.clientDataSetId, '41')
+    assert.equal(add.kind, 'AddPieces')
+    assert.equal(add.message.clientDataSetId, create.message.clientDataSetId)
+    assert.equal(service.state.dataSets.length, 2)
+  })
+
+  it('a step into it is refused with 409 ENDED and a clear line', async () => {
+    service.state.dataSets.push('41')
+    service.state.ended.add('41')
+    await assert.rejects(signAddPieces(clientOf(remote()), { clientDataSetId: 41n, nonce: 1n, pieces: [{ pieceCid: await pieceCid(), metadata: [] }] }), (err) => {
+      assert.equal(err.code, 'ENDED')
+      assert.equal(err.status, 409)
+      assert.match(err.message, /refused AddPieces: ENDED \(HTTP 409\) data set was ended – Le Space ended this data set/)
+      return true
+    })
   })
 })
