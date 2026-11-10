@@ -132,10 +132,11 @@ How it works:
 - Data sets carry only `app` = `label` and `customer` = `tag` (plus `withIPFSIndexing` if `datasetMetadata` has it). Never `withCDN`, no `source`. `datasetMetadata` is otherwise ignored.
 - At most 3 copies (`copies` or `providerIds`): the service signs at most 3 data sets per account.
 - `list` also shows the pieces on chain in this account's data sets (the payer's data sets whose metadata is this `label` and `tag`), so a new machine without the ledger sees what there is. `verify` and `prune` touch only those data sets.
-- `prune` works: it schedules piece removals through the service, which signs them even when no backup is paid. No data set is ever terminated.
+- `prune` works: it schedules piece removals through the service, which signs them even when no backup is paid. The tool never terminates a data set.
+- Le Space may end (terminate) a data set. It stays on chain until its end epoch, but takes no more pieces. `status`, `list` and `verify` show it as `ended <date> (epoch …)`. `verify` counts its copies as missing, and `prune` leaves it alone. Uploads never reuse it: synapse picks only data sets that have not ended for a provider, and otherwise creates a new one with a new `clientDataSetId`.
 - `fund` refuses, `status` shows the mode and the data sets, and the daily mail has no account section: the payer is not the customer's.
 
-Refusals of the service end the step with the code, the service's message and a hint, e.g. `remote signer refused CreateDataSet: NO_BACKUP (HTTP 409) no backup paid for now – …`. Codes: `SIGNATURE`, `REPLAY`, `STALE` (401), `NO_BACKUP`, `COPIES`, `QUOTA` (409), `METADATA`, `PROVIDER` (400), `DATA_SET` (403), `TERMS` (412).
+Refusals of the service end the step with the code, the service's message and a hint, e.g. `remote signer refused CreateDataSet: NO_BACKUP (HTTP 409) no backup paid for now – …`. Codes: `SIGNATURE`, `REPLAY`, `STALE` (401), `NO_BACKUP`, `COPIES`, `QUOTA`, `ENDED` (409), `METADATA`, `PROVIDER` (400), `DATA_SET` (403), `TERMS` (412).
 
 Tests: `npm test` runs the remote signer against a mocked service that checks each request as Le Space Credits does.
 

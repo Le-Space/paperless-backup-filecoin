@@ -12,6 +12,7 @@
 import { hashTypedData, isAddress, isAddressEqual, recoverTypedDataAddress } from 'viem'
 import { privateKeyToAccount, toAccount } from 'viem/accounts'
 import { EIP712Types, getStorageDomain } from '@filoz/synapse-core/typed-data'
+import { epochToDate } from '@filoz/synapse-core/utils'
 
 /** The signed line's version; the service bumps it when its shape changes. */
 export const SIGN_SCHEME = 'ls-backup-sign/v1'
@@ -31,6 +32,7 @@ const REFUSALS = {
   METADATA: 'the data set metadata is not the one the service signs (only app = label, customer = tag, optionally withIPFSIndexing; no withCDN)',
   PROVIDER: 'the storage provider is not approved by the storage service',
   DATA_SET: 'that data set does not belong to this account',
+  ENDED: 'Le Space ended this data set; it takes no more pieces, and the next run creates a new data set for that provider',
   TERMS: 'the current terms are not accepted; accept them in the app',
 }
 
@@ -62,6 +64,27 @@ export function backupMetadata({ label, tag, withIPFSIndexing = false }) {
 
 /** Is this data set (from findDataSets, owned by the payer) one of this account's backups? */
 export const isOwnDataSet = (ds, { label, tag }) => ds?.metadata?.app === label && ds?.metadata?.customer === tag
+
+/**
+ * When a data set's storage ends: null while it runs, else its end epoch and
+ * that epoch as a date. A data set the payer terminated (pdpEndEpoch != 0)
+ * stays live on chain until then, but takes no more pieces.
+ */
+export function dataSetEnd(ds, chain) {
+  const epoch = BigInt(ds?.pdpEndEpoch ?? 0n)
+  if (epoch === 0n) return null
+  return { epoch, date: epochToDate(Number(epoch), chain.genesisTimestamp) }
+}
+
+/**
+ * This account's data sets among the payer's (from findDataSets): live on
+ * chain and named by label and tag, each with `ended` (see dataSetEnd).
+ */
+export const ownDataSetsOf = (all, { label, tag, chain }) =>
+  all.filter((ds) => ds.isLive && isOwnDataSet(ds, { label, tag })).map((ds) => ({ ...ds, ended: dataSetEnd(ds, chain) }))
+
+/** How list, status and verify name a data set's state. */
+export const dataSetState = (ds) => (ds.ended ? `ended ${ds.ended.date.toISOString().slice(0, 10)} (epoch ${ds.ended.epoch})` : 'live')
 
 /** Checks remoteSigner from config.json; returns it with the creditsUrl normalised. */
 export function checkConfig(rs) {

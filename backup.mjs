@@ -49,7 +49,7 @@ import { createClient, createPublicClient, createWalletClient, http } from 'viem
 import { getTransport } from '@filoz/synapse-core/client'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import nodemailer from 'nodemailer'
-import { backupMetadata, checkConfig, createRemoteSigner, isOwnDataSet, parseBackupKey, payerAccount } from './remote-signer.mjs'
+import { backupMetadata, checkConfig, createRemoteSigner, dataSetState, ownDataSetsOf, parseBackupKey, payerAccount } from './remote-signer.mjs'
 import { Agent, setGlobalDispatcher } from 'undici'
 
 // A provider answers an upload only after it has hashed the whole piece, which
@@ -260,10 +260,13 @@ async function chosenContexts(s) {
 }
 
 // Remote-signer mode: this account's data sets are the payer's whose metadata
-// names this backup (app = label, customer = tag).
+// names this backup (app = label, customer = tag). Each carries `ended` when
+// Le Space terminated it: it is still on chain until its end epoch but takes
+// no more pieces. Uploads never pick one: synapse's provider resolution
+// (StorageContext.resolveByProviderId) skips data sets with pdpEndEpoch != 0
+// and creates a new one for that provider.
 async function ownDataSets(s) {
-  const all = await s.storage.findDataSets({ address: REMOTE.payer })
-  return all.filter((ds) => ds.isLive && isOwnDataSet(ds, REMOTE))
+  return ownDataSetsOf(await s.storage.findDataSets({ address: REMOTE.payer }), { label: REMOTE.label, tag: REMOTE.tag, chain })
 }
 
 function regionCodes() {
@@ -498,7 +501,7 @@ async function status() {
     log(`network ${chain.name}, remote signer ${REMOTE.creditsUrl} (product ${REMOTE.product})`)
     log(`account ${REMOTE.account}, backup key ${s.backupAddress}, signer ${REMOTE.signer}, payer ${REMOTE.payer}`)
     const mine = await ownDataSets(s)
-    log(`data sets of this backup (${REMOTE.label}): ${mine.map((d) => `${d.pdpVerifierDataSetId} (provider ${d.providerId})`).join(', ') || 'none yet'}`)
+    log(`data sets of this backup (${REMOTE.label}): ${mine.map((d) => `${d.pdpVerifierDataSetId} (provider ${d.providerId}, ${dataSetState(d)})`).join(', ') || 'none yet'}`)
     log(`providers ${(await resolveProviders()).map((p) => p.id).join(', ')}; the service checks paid time and quota on each step`)
     return
   }
@@ -621,6 +624,7 @@ async function list() {
   if (!REMOTE) return
   const s = await synapse()
   for (const ds of await ownDataSets(s)) {
+    console.log(['chain', `data set ${ds.pdpVerifierDataSetId}`, `provider ${ds.providerId}`, dataSetState(ds)].join(' | '))
     const ctx = await s.storage.createContext({ dataSetId: ds.pdpVerifierDataSetId })
     for await (const piece of ctx.getPieces()) console.log(['chain', `data set ${ds.pdpVerifierDataSetId}`, `provider ${ds.providerId}`, `piece ${piece.pieceId}`, piece.pieceCid.toString()].join(' | '))
   }
@@ -632,10 +636,17 @@ async function verify() {
   let missing = 0
   const byDataSet = new Map()
   for (const e of live) for (const c of e.copies) byDataSet.set(c.dataSetId, [...(byDataSet.get(c.dataSetId) ?? []), e.pieceCid])
-  const own = REMOTE ? new Set((await ownDataSets(s)).map((d) => String(d.pdpVerifierDataSetId))) : null
+  const own = REMOTE ? new Map((await ownDataSets(s)).map((d) => [String(d.pdpVerifierDataSetId), d])) : null
   for (const [dataSetId, expected] of byDataSet) {
     if (own && !own.has(String(dataSetId))) {
       for (const cid of expected) log(`MISSING data set ${dataSetId} is not (or no longer) a data set of this backup ${cid}`)
+      missing += expected.length
+      continue
+    }
+    // An ended data set's copies go away at its end epoch: not counted as kept.
+    const ended = own?.get(String(dataSetId))?.ended
+    if (ended) {
+      for (const cid of expected) log(`ENDED   data set ${dataSetId} ${dataSetState(own.get(String(dataSetId)))} ${cid}`)
       missing += expected.length
       continue
     }
@@ -696,11 +707,16 @@ async function prune(yes) {
   const s = await synapse()
   // Remote-signer mode: removals go through the service (SchedulePieceRemovals),
   // only in this backup's data sets; no data set is ever terminated.
-  const own = REMOTE ? new Set((await ownDataSets(s)).map((d) => String(d.pdpVerifierDataSetId))) : null
+  const own = REMOTE ? new Map((await ownDataSets(s)).map((d) => [String(d.pdpVerifierDataSetId), d])) : null
   for (const e of old) {
     for (const c of e.copies) {
       if (own && !own.has(String(c.dataSetId))) {
         log(`skipping data set ${c.dataSetId}: not a data set of this backup`)
+        continue
+      }
+      // An ended data set takes no removals; its pieces go with it.
+      if (own?.get(String(c.dataSetId))?.ended) {
+        log(`skipping data set ${c.dataSetId}: ${dataSetState(own.get(String(c.dataSetId)))}`)
         continue
       }
       const ctx = await s.storage.createContext({ dataSetId: BigInt(c.dataSetId) })
