@@ -28,6 +28,32 @@ Paperless ── document_exporter ──► zip ── age ──► one encryp
 3. The piece is uploaded with the [Synapse SDK](https://github.com/FilOzone/synapse-sdk) to the chosen providers.
 4. `ledger.json` records the piece, its checksum and, per copy, the provider, its declared location, the data set and the piece id.
 
+### Backups above 1 GB: parts
+
+Some providers take no piece above 1 GiB (with fr32 expansion), whatever their registry entry says. An encrypted export above `PART_BYTES` = 1,000,000,000 bytes is therefore uploaded in parts: byte ranges of the one sealed file, each at most `PART_BYTES`. The primary stores every part, the other copies pull them from it, and each data set adds all parts in one `AddPieces`. A copy counts only with every part.
+
+A backup of at most `PART_BYTES` stays one piece with the ledger entry it always had. A backup in parts adds to the same entry (additive, so older readers still find `pieceCid`, `size`, `sealedSha256`):
+
+```json
+{
+  "pieceCid": "<first part>",
+  "size": 2100000000,
+  "sealedSha256": "<the whole sealed file>",
+  "plainSha256": "<the zip>",
+  "parts": [
+    { "pieceCid": "<part 1>", "offset": 0, "size": 1000000000, "sha256": "…" },
+    { "pieceCid": "<part 2>", "offset": 1000000000, "size": 1000000000, "sha256": "…" },
+    { "pieceCid": "<part 3>", "offset": 2000000000, "size": 100000000, "sha256": "…" }
+  ],
+  "copies": [
+    { "providerId": 1, "dataSetId": 7, "pieceId": 10, "pieceIds": [10, 11, 12],
+      "retrievalUrl": "https://sp.example.com/piece/<part 1>", "retrievalUrls": ["…", "…", "…"] }
+  ]
+}
+```
+
+`verify` reports a copy as missing when any part is gone, `prune` removes all parts of a copy in one removal, `list` and `status` show the number of parts, and `restore <first part's pieceCid>` fetches every part, checks each SHA-256, joins them, checks the whole, then decrypts. Every non-last part is exactly `PART_BYTES` long, which the piece CID tells: a reader without the ledger (the app listing the chain) groups a backup's pieces by that. Tools before parts see only the first part: their `restore` fails on the checksum, and their `prune` would leave the other parts.
+
 Provider choice: the providers you name, or the first `copies` approved providers inside `regions` — one per operator first, then one per country. If too few qualify, the backup stops instead of storing elsewhere.
 
 ## Tested on the testnet
@@ -67,7 +93,7 @@ Step-by-step setup: [HOWTO.txt](HOWTO.txt). Auf Deutsch: [ANLEITUNG.txt](ANLEITU
 | `node backup.mjs run` | export, encrypt, upload |
 | `node backup.mjs verify` | is every copy still in its data set? |
 | `node backup.mjs list` | stored backups |
-| `node backup.mjs restore <pieceCid> [out.zip]` | download, check, decrypt |
+| `node backup.mjs restore <pieceCid> [out.zip]` | download, check, decrypt (a backup in parts: by its first part's piece CID) |
 | `node backup.mjs prune --yes` | delete backups older than `keepWeeks` (the newest complete one always stays) |
 | `node backup.mjs mail-from-paperless` / `mail-check` / `mail-test` / `mail-preview` | take the SMTP login from a Paperless mail account; check the login; send a test report; print the report (and a low-funds and a failure example) without sending |
 | `node backup.mjs daily` | once a day: back up if Paperless changed, verify, prune, mail a report; catches up if the machine was off |

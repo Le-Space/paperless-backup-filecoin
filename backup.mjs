@@ -3,7 +3,9 @@
 //
 // The Paperless export (documents + database) is encrypted with age on this
 // machine and uploaded as one piece to several independent storage providers,
-// chosen by id or by region and number of copies (config.json).
+// chosen by id or by region and number of copies (config.json). An export
+// above PART_BYTES (1 GB) goes up in parts, each part a piece on every copy
+// (parts.mjs), since some providers take no piece above 1 GiB.
 // Secrets: the macOS keychain, or files named by WALLET_KEY_FILE / AGE_IDENTITY_FILE.
 // With SESSION_KEY_FILE (and config.payer) uploads are signed by a session key
 // the wallet authorized for adding pieces only, never by the wallet itself: a
@@ -22,7 +24,7 @@
 //   node backup.mjs run             export + encrypt + upload
 //   node backup.mjs list            what the ledger holds
 //   node backup.mjs verify          is every copy still in its data set?
-//   node backup.mjs restore <pieceCid> [out.zip]
+//   node backup.mjs restore <pieceCid> [out.zip]   (the first part's, for a backup in parts)
 //   node backup.mjs prune --yes     delete pieces older than keepWeeks
 //   node backup.mjs session-login <hours> <key-file>   authorize a new session key (add pieces only)
 //   node backup.mjs session-revoke <address>           withdraw a session key
@@ -49,6 +51,7 @@ import { createClient, createPublicClient, createWalletClient, http } from 'viem
 import { getTransport } from '@filoz/synapse-core/client'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import nodemailer from 'nodemailer'
+import { PART_BYTES, copyPieceIds, copyUrls, entryParts, isMultipart, missingParts, partHasher, partRanges, pieceFields, reassemble, uploadParts } from './parts.mjs'
 import { backupMetadata, checkConfig, createRemoteSigner, dataSetState, ownDataSetsOf, parseBackupKey, payerAccount } from './remote-signer.mjs'
 import { Agent, setGlobalDispatcher } from 'undici'
 
@@ -433,6 +436,9 @@ const hashing = (hash) => new Transform({ transform(chunk, _, done) { hash.updat
 // A file as a web stream, hashed as it is read.
 const fileStream = (path, hash) => Readable.toWeb(hash ? createReadStream(path).pipe(hashing(hash)) : createReadStream(path))
 
+// One part of the sealed file as a web stream.
+const rangeStream = (path, { offset, size }) => Readable.toWeb(createReadStream(path, { start: offset, end: offset + size - 1 }))
+
 // The plain export holds every document and the mail credentials, so it lives
 // only as long as the encryption takes. Everything streams: the zip through
 // age into an encrypted file beside it, hashing both on the way, so memory
@@ -446,16 +452,22 @@ async function encryptedExport() {
   try {
     const plainHash = createHash('sha256')
     const sealedHash = createHash('sha256')
+    const partHashes = partHasher(PART_BYTES)
     const e = new Encrypter()
     e.addRecipient(config.ageRecipient)
     const sealedStream = await e.encrypt(fileStream(zip, plainHash))
-    await pipeline(Readable.fromWeb(sealedStream), hashing(sealedHash), createWriteStream(sealedPath, { mode: 0o600 }))
+    await pipeline(Readable.fromWeb(sealedStream), hashing(sealedHash), partHashes.stream, createWriteStream(sealedPath, { mode: 0o600 }))
     const sealedBytes = statSync(sealedPath).size
     if (sealedBytes > MAX_UPLOAD) fail(`encrypted export is ${sealedBytes} bytes, above the 64 GiB limit`)
+    const ranges = partRanges(sealedBytes, PART_BYTES)
+    const partSha256 = partHashes.digests()
+    if (partSha256.length !== ranges.length) fail(`hashed ${partSha256.length} parts of ${ranges.length}`)
     return {
       name,
       sealedPath,
       sealedBytes,
+      ranges,
+      partSha256,
       plainBytes: statSync(zip).size,
       plainSha256: plainHash.digest('hex'),
       sealedSha256: sealedHash.digest('hex'),
@@ -495,8 +507,18 @@ async function providers() {
   }
 }
 
+// The ledger in one line: live backups, the latest, and whether it is in parts.
+function ledgerLine() {
+  const live = readLedger().filter((e) => !e.deleted)
+  const last = live.at(-1)
+  if (!last) return 'ledger: no backup yet'
+  const parts = isMultipart(last) ? ` in ${last.parts.length} parts` : ''
+  return `ledger: ${live.length} backup(s) kept; latest ${last.date.slice(0, 10)}, ${(last.size / 2 ** 20).toFixed(0)} MiB${parts}, ${last.copies.length}/${last.requestedCopies ?? last.copies.length} copies${last.complete ? '' : ' (INCOMPLETE)'}`
+}
+
 async function status() {
   const s = await synapse()
+  log(ledgerLine())
   if (REMOTE) {
     log(`network ${chain.name}, remote signer ${REMOTE.creditsUrl} (product ${REMOTE.product})`)
     log(`account ${REMOTE.account}, backup key ${s.backupAddress}, signer ${REMOTE.signer}, payer ${REMOTE.payer}`)
@@ -533,7 +555,7 @@ async function fund(months = 3) {
 
 async function plan() {
   const chosen = await resolveProviders()
-  const { name, sealedPath, sealedBytes, plainSha256 } = await encryptedExport()
+  const { name, sealedPath, sealedBytes, plainSha256, ranges } = await encryptedExport()
   try {
     // Prove the keychain identity opens what the recipient sealed, before anything leaves this Mac.
     const d = new Decrypter()
@@ -547,9 +569,9 @@ async function plan() {
   }
   const gib = sealedBytes / 2 ** 30
   const perCopy = (sealedBytes / 2 ** 40) * 2.5 + 0.12
-  log(`${name}: ${sealedBytes} bytes encrypted (${gib.toFixed(2)} GiB)`)
+  log(`${name}: ${sealedBytes} bytes encrypted (${gib.toFixed(2)} GiB)${ranges.length > 1 ? `, in ${ranges.length} parts of at most ${PART_BYTES} bytes` : ''}`)
   log(`providers: ${chosen.map((p) => `${p.id} ${p.name} (${p.location})`).join('; ')}`)
-  log(`estimate: ~${(perCopy * chosen.length).toFixed(3)} USD per month for ${chosen.length} copies (one piece; each further kept week adds the storage part)`)
+  log(`estimate: ~${(perCopy * chosen.length).toFixed(3)} USD per month for ${chosen.length} copies (${ranges.length > 1 ? `${ranges.length} pieces` : 'one piece'}; each further kept week adds the storage part)`)
 }
 
 // The primary copy is the one this machine uploads; the others pull from it.
@@ -566,8 +588,12 @@ async function uploadWithRetry(s, chosen, backup) {
     const contexts = await s.storage.createContexts({ providerIds: order.map((p) => BigInt(p.id)), metadata: datasetMetadata() })
     log(`uploading ${backup.sealedBytes} bytes to providers ${order.map((p) => p.id).join(', ')} (primary ${order[0].id}) …`)
     try {
-      // A fresh stream from the encrypted file for every attempt.
-      const result = await s.storage.upload(fileStream(backup.sealedPath), { contexts })
+      // A fresh stream from the encrypted file for every attempt. One piece as
+      // always; in parts, each part a piece, all parts on every copy.
+      const result =
+        backup.ranges.length > 1
+          ? await uploadParts(contexts, backup.ranges, (range) => rangeStream(backup.sealedPath, range), { log })
+          : await s.storage.upload(fileStream(backup.sealedPath), { contexts })
       if (!refused.length) return result
       log(`WARNING: without provider(s) ${refused.map((r) => r.providerId).join(', ')}: ${result.copies.length} of ${chosen.length} copies`)
       return { ...result, requestedCopies: chosen.length, complete: result.copies.length >= chosen.length, failedAttempts: [...refused, ...(result.failedAttempts ?? [])] }
@@ -587,7 +613,7 @@ async function runBackup() {
   const s = await synapse()
   const backup = await encryptedExport()
   try {
-    const { transaction } = await s.storage.prepare({ context: await chosenContexts(s), pieceSizes: [BigInt(backup.sealedBytes)] })
+    const { transaction } = await s.storage.prepare({ context: await chosenContexts(s), pieceSizes: backup.ranges.map((r) => BigInt(r.size)) })
     if (transaction && REMOTE) fail('the Le Space payer is not funded for this upload; tell Le Space (nothing was signed)')
     if (transaction) fail(`account not funded for this upload (needs ${formatUnits(transaction.depositAmount)} USDFC); run: node backup.mjs fund`)
 
@@ -595,8 +621,7 @@ async function runBackup() {
     const entry = jsonable({
       name: backup.name,
       date: new Date().toISOString(),
-      pieceCid: result.pieceCid.toString(),
-      size: backup.sealedBytes,
+      ...pieceFields(backup, result),
       plainBytes: backup.plainBytes,
       plainSha256: backup.plainSha256,
       sealedSha256: backup.sealedSha256,
@@ -607,7 +632,8 @@ async function runBackup() {
       deleted: false,
     })
     writeLedger([...readLedger(), entry])
-    log(`piece ${entry.pieceCid}: ${result.copies.length}/${result.requestedCopies} copies${result.complete ? '' : ' (INCOMPLETE)'}`)
+    const pieces = isMultipart(entry) ? `${entry.parts.length} parts, first piece` : 'piece'
+    log(`${pieces} ${entry.pieceCid}: ${result.copies.length}/${result.requestedCopies} copies${result.complete ? '' : ' (INCOMPLETE)'}`)
     return entry
   } finally {
     rmSync(backup.sealedPath, { force: true })
@@ -617,7 +643,8 @@ async function runBackup() {
 async function list() {
   for (const e of readLedger()) {
     const where = e.copies.map((c) => `${c.providerId}@${(c.location ?? '').replace(/;.*$/, '')}`).join(' ')
-    console.log([e.date.slice(0, 10), e.deleted ? 'deleted' : e.complete ? 'complete' : 'partial', e.pieceCid, `${(e.size / 2 ** 20).toFixed(0)} MiB`, where].join(' | '))
+    const size = `${(e.size / 2 ** 20).toFixed(0)} MiB${isMultipart(e) ? ` in ${e.parts.length} parts` : ''}`
+    console.log([e.date.slice(0, 10), e.deleted ? 'deleted' : e.complete ? 'complete' : 'partial', e.pieceCid, size, where].join(' | '))
   }
   // Remote-signer mode: what the chain holds for this backup, also without a
   // ledger (a new VM restoring).
@@ -635,28 +662,31 @@ async function verify() {
   const live = readLedger().filter((e) => !e.deleted)
   let missing = 0
   const byDataSet = new Map()
-  for (const e of live) for (const c of e.copies) byDataSet.set(c.dataSetId, [...(byDataSet.get(c.dataSetId) ?? []), e.pieceCid])
+  // A copy is there only with every part of its backup.
+  for (const e of live) for (const c of e.copies) byDataSet.set(c.dataSetId, [...(byDataSet.get(c.dataSetId) ?? []), e])
+  const named = (e) => (isMultipart(e) ? `${e.pieceCid} (${e.parts.length} parts)` : e.pieceCid)
   const own = REMOTE ? new Map((await ownDataSets(s)).map((d) => [String(d.pdpVerifierDataSetId), d])) : null
   for (const [dataSetId, expected] of byDataSet) {
     if (own && !own.has(String(dataSetId))) {
-      for (const cid of expected) log(`MISSING data set ${dataSetId} is not (or no longer) a data set of this backup ${cid}`)
+      for (const e of expected) log(`MISSING data set ${dataSetId} is not (or no longer) a data set of this backup ${named(e)}`)
       missing += expected.length
       continue
     }
     // An ended data set's copies go away at its end epoch: not counted as kept.
     const ended = own?.get(String(dataSetId))?.ended
     if (ended) {
-      for (const cid of expected) log(`ENDED   data set ${dataSetId} ${dataSetState(own.get(String(dataSetId)))} ${cid}`)
+      for (const e of expected) log(`ENDED   data set ${dataSetId} ${dataSetState(own.get(String(dataSetId)))} ${named(e)}`)
       missing += expected.length
       continue
     }
     const ctx = await s.storage.createContext({ dataSetId: BigInt(dataSetId) })
     const present = new Set()
     for await (const piece of ctx.getPieces()) present.add(piece.pieceCid.toString())
-    for (const cid of expected) {
-      const ok = present.has(cid)
-      if (!ok) missing++
-      log(`${ok ? 'ok     ' : 'MISSING'} data set ${dataSetId} (provider ${ctx.provider?.id ?? '?'}) ${cid}`)
+    for (const e of expected) {
+      const lacking = missingParts(e, present)
+      if (lacking.length) missing++
+      const which = lacking.length && isMultipart(e) ? ` – lacks part ${lacking.map((p) => e.parts.indexOf(p) + 1).join(', ')} of ${e.parts.length}` : ''
+      log(`${lacking.length ? 'MISSING' : 'ok     '} data set ${dataSetId} (provider ${ctx.provider?.id ?? '?'}) ${named(e)}${which}`)
     }
   }
   return missing
@@ -664,7 +694,8 @@ async function verify() {
 
 async function restore(pieceCid, out) {
   if (!pieceCid) fail('usage: node backup.mjs restore <pieceCid> [out.zip]')
-  const entry = readLedger().find((e) => e.pieceCid === pieceCid)
+  const entry = readLedger().find((e) => e.pieceCid === pieceCid || entryParts(e).some((p) => p.pieceCid === pieceCid))
+  if (entry && isMultipart(entry)) return restoreParts(entry, out)
   let sealed
   try {
     sealed = await (await synapse()).storage.download({ pieceCid })
@@ -689,6 +720,59 @@ async function restore(pieceCid, out) {
   log(`restored to ${target}; import into an empty Paperless with: document_importer <dir-with-unzipped-export>`)
 }
 
+// A backup in parts: every part fetched (synapse first, then each copy's
+// public URL), checked against its SHA-256, appended to one sealed file
+// beside the target, the whole checked, then decrypted as a stream.
+async function restoreParts(entry, out) {
+  const target = out ?? join(HERE, `${entry.name ?? 'restore'}.zip`)
+  const sealedPath = `${target}.age.part`
+  let s = null
+  try {
+    s = await synapse()
+  } catch (err) {
+    log(`no synapse client (${err.message}); fetching from the providers' piece URLs`)
+  }
+  const fetchPart = async (part, i) => {
+    log(`part ${i + 1}/${entry.parts.length}: ${part.pieceCid} …`)
+    if (s) {
+      try {
+        return await s.storage.download({ pieceCid: part.pieceCid })
+      } catch (err) {
+        log(`part ${i + 1}: synapse download failed (${err.message}); trying the copies' URLs`)
+      }
+    }
+    for (const c of entry.copies) {
+      const url = copyUrls(c)[i]
+      if (!url) continue
+      const res = await fetch(url).catch(() => null)
+      if (res?.ok) return new Uint8Array(await res.arrayBuffer())
+    }
+    return null
+  }
+  const file = createWriteStream(sealedPath, { mode: 0o600 })
+  const write = (bytes) => new Promise((resolve, reject) => file.write(bytes, (err) => (err ? reject(err) : resolve())))
+  try {
+    try {
+      await reassemble(entry, fetchPart, { write })
+    } catch (err) {
+      fail(`restore failed: ${err.message}`)
+    } finally {
+      await new Promise((resolve) => file.end(resolve))
+    }
+    const d = new Decrypter()
+    d.addIdentity(ageIdentity())
+    const plainHash = createHash('sha256')
+    await pipeline(Readable.fromWeb(await d.decrypt(fileStream(sealedPath))), hashing(plainHash), createWriteStream(target, { mode: 0o600 }))
+    if (entry.plainSha256 && plainHash.digest('hex') !== entry.plainSha256) {
+      rmSync(target, { force: true })
+      fail('the decrypted export does not match the ledger checksum')
+    }
+  } finally {
+    rmSync(sealedPath, { force: true })
+  }
+  log(`restored ${entry.parts.length} parts to ${target}; import into an empty Paperless with: document_importer <dir-with-unzipped-export>`)
+}
+
 async function prune(yes) {
   if (process.env.SESSION_KEY_FILE && !REMOTE) fail('pruning removes pieces, which a session key may not; run it with the wallet')
   const cutoff = Date.now() - config.keepWeeks * 7 * DAY
@@ -699,7 +783,7 @@ async function prune(yes) {
     return []
   }
   if (ledger.filter((e) => !e.deleted && e.complete).length - old.length < 1) fail('refusing to delete: no complete newer backup would remain')
-  for (const e of old) log(`${yes ? 'deleting' : 'would delete'} ${e.date.slice(0, 10)} ${e.pieceCid}`)
+  for (const e of old) log(`${yes ? 'deleting' : 'would delete'} ${e.date.slice(0, 10)} ${e.pieceCid}${isMultipart(e) ? ` and its other ${e.parts.length - 1} parts` : ''}`)
   if (!yes) {
     log('pass --yes to delete (irreversible)')
     return []
@@ -719,8 +803,9 @@ async function prune(yes) {
         log(`skipping data set ${c.dataSetId}: ${dataSetState(own.get(String(c.dataSetId)))}`)
         continue
       }
+      // Every part of the copy in one removal (one SchedulePieceRemovals).
       const ctx = await s.storage.createContext({ dataSetId: BigInt(c.dataSetId) })
-      await ctx.deletePiece({ piece: BigInt(c.pieceId) })
+      await ctx.deletePieces({ pieces: copyPieceIds(c).map((id) => BigInt(id)) })
     }
     e.deleted = true
     writeLedger(ledger)
@@ -950,7 +1035,7 @@ function renderReport(r) {
     lines.push(...e.copies.map((c) => `  – ${t.copy(c.providerId, country(c.location))}`))
     lines.push(r.missing ? t.verifyMissing(r.missing) : t.verifyOk)
     if (r.pruned) lines.push(t.pruned(r.pruned, config.keepWeeks))
-    lines.push(`${t.piece}: ${e.pieceCid}`)
+    lines.push(`${t.piece}: ${e.pieceCid}${isMultipart(e) ? ` (+${e.parts.length - 1})` : ''}`)
   }
 
   const a = r.account
