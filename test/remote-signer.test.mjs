@@ -222,6 +222,58 @@ describe('remote signer', () => {
     assert.equal(service.state.requests[0].message.nonce, '5')
   })
 
+  it('AddPieces with several pieces (a backup in parts): one round-trip, every part signed in order', async () => {
+    service.state.dataSets.push('7')
+    const parts = await Promise.all([1024, 2048, 512].map((n) => pieceCid(n)))
+    const pieces = parts.map((cid) => ({ pieceCid: cid, metadata: [] }))
+    await signAddPieces(clientOf(remote()), { clientDataSetId: 7n, nonce: 6n, pieces })
+    assert.equal(service.state.requests.length, 1)
+    const [req] = service.state.requests
+    assert.equal(req.kind, 'AddPieces')
+    assert.equal(req.message.pieceData.length, 3)
+    assert.deepEqual(req.message.pieceData.map((p) => Piece.tryFrom(fromHex(p.data)).toString()), parts.map(String))
+  })
+
+  it('the quota counts every part of one AddPieces', async () => {
+    service.state.dataSets.push('7')
+    const parts = await Promise.all([1024, 2048, 512].map((n) => pieceCid(n)))
+    const padded = parts.map((cid) => cid.paddedSize)
+    const pieces = parts.map((cid) => ({ pieceCid: cid, metadata: [] }))
+    // Room for the first two parts, not for the third.
+    service.state.stored.set('7', QUOTA - padded[0] - padded[1])
+    await assert.rejects(signAddPieces(clientOf(remote()), { clientDataSetId: 7n, nonce: 1n, pieces }), { code: 'QUOTA', status: 409 })
+    await signAddPieces(clientOf(remote()), { clientDataSetId: 7n, nonce: 2n, pieces: pieces.slice(0, 2) })
+  })
+
+  it('a new data set for a backup in parts: CreateDataSet, then one AddPieces with all parts', async () => {
+    const transport = http('http://127.0.0.1:9')
+    const synapse = new Synapse({
+      client: createClient({ chain, transport, account: payerAccount(PAYER) }),
+      sessionClient: createClient({ chain, transport, account: remote() }),
+      source: null,
+      withCDN: false,
+      pieceBatching: false,
+    })
+    const provider = { id: 1n, serviceProvider: PROVIDER, pdp: { serviceURL: 'https://sp.example.com' } }
+    const warm = { getClientDataSets: async () => ({ items: [], nextCursor: null }), getDataSetMetadata: async () => ({}), hasActivePieces: async () => false }
+    const resolution = await StorageContext.resolveByProviderId(PAYER, 1n, backupMetadata({ label: LABEL, tag: TAG }), warm, { getProvider: async () => provider }, 0n)
+    const context = await StorageContext.createWithSelectedProvider(resolution, synapse, warm)
+    const parts = await Promise.all([1024, 2048].map((n) => pieceCid(n)))
+    await context.presignForCommit(parts.map((cid) => ({ pieceCid: cid })))
+    const [create, add, ...rest] = service.state.requests
+    assert.equal(create.kind, 'CreateDataSet')
+    assert.equal(add.kind, 'AddPieces')
+    assert.equal(add.message.pieceData.length, 2)
+    assert.equal(rest.length, 0)
+  })
+
+  it('SchedulePieceRemovals for every part of a copy: one round-trip', async () => {
+    service.state.dataSets.push('7')
+    await signSchedulePieceRemovals(clientOf(remote()), { clientDataSetId: 7n, pieceIds: [10n, 11n, 12n] })
+    assert.equal(service.state.requests.length, 1)
+    assert.deepEqual(service.state.requests[0].message.pieceIds, ['10', '11', '12'])
+  })
+
   it('SchedulePieceRemovals: one round-trip, also when no backup is paid', async () => {
     service.state.dataSets.push('7')
     service.state.paid = false
