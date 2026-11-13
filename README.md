@@ -184,4 +184,6 @@ Tests: `npm test` runs the remote signer against a mocked service that checks ea
 
 ## License
 
-MIT — by [Le Space](https://github.com/Le-Space).
+Copyright © 2026 [Le Space](https://github.com/Le-Space).
+
+Free software under the **GNU Affero General Public License, version 3 or later** (`AGPL-3.0-or-later`), see [LICENSE](LICENSE).
