@@ -13,7 +13,7 @@
     "age",
     "decentralized"
   ],
-  "license": "MIT",
+  "license": "AGPL-3.0-or-later",
   "type": "module",
   "private": true,
   "dependencies": {
