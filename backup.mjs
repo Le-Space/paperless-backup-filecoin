@@ -28,6 +28,8 @@
 //   node backup.mjs prune --yes     delete pieces older than keepWeeks (by the ledger)
 //   node backup.mjs retain [--yes]  keep the last N and one per day/week/month (config.retention),
 //                                   read from the chain; --yes schedules the removal of the rest
+//   node backup.mjs retire [--yes]  end (terminate) the data sets at providers the config no longer
+//                                   names, once the newest backup is at the named ones (wallet only)
 //   node backup.mjs session-login <hours> <key-file>   authorize a new session key (add pieces only)
 //   node backup.mjs session-revoke <address>           withdraw a session key
 //   node backup.mjs daily           once a day: back up if Paperless changed, verify, prune, mail
@@ -56,7 +58,7 @@ import nodemailer from 'nodemailer'
 import { PART_BYTES, copyPieceIds, copyUrls, entryParts, isMultipart, missingParts, partHasher, partRanges, pieceFields, reassemble, uploadParts } from './parts.mjs'
 import { tryFrom as pieceFrom } from '@filoz/synapse-core/piece'
 import { dataSetLive, getActivePiecesByCursor, getScheduledRemovals } from '@filoz/synapse-core/pdp-verifier'
-import { backupsOnChain, consistentDates, describePlan, planRetention, removalsByDataSet, retentionPolicy } from './retention.mjs'
+import { backupsOnChain, consistentDates, describePlan, planRetention, removalsByDataSet, retentionPolicy, retirePlan } from './retention.mjs'
 import { backupMetadata, checkConfig, createRemoteSigner, dataSetState, ownDataSetsOf, parseBackupKey, payerAccount } from './remote-signer.mjs'
 import { Agent, setGlobalDispatcher } from 'undici'
 
@@ -887,7 +889,7 @@ async function chainBackups(owner) {
       if (nextCursor == null) break
       start = nextCursor
     }
-    read.push({ dataSetId: id, pieces: consistentDates(pieces) })
+    read.push({ dataSetId: id, providerId: String(ds.providerId), pieces: consistentDates(pieces) })
   }
   return { sets: read, scheduled }
 }
@@ -945,6 +947,36 @@ async function retain(yes) {
   for (const e of ledger) if (!e.deleted && entryParts(e).every((p) => gone.has(p.pieceCid))) changed = e.deleted = true
   if (changed) writeLedger(ledger)
   write(report(true))
+  return plan
+}
+
+// After the backups moved to other providers for good (config.providerIds),
+// the data sets at the old ones still cost: `retire` ends them (terminate:
+// the provider keeps them until the end epoch, then they are gone). Only
+// with the wallet: Le Space ends its own data sets, and a session key may
+// not. Nothing ends before the newest backup is on chain at the named
+// providers, nor a data set that alone holds the start backup or an undated one.
+async function retire(yes) {
+  if (REMOTE) fail('with the remote signer, Le Space ends its data sets; retire is for the wallet')
+  if (process.env.SESSION_KEY_FILE) fail('a session key may not end data sets; run retire with the wallet')
+  const owner = config.payer ?? process.env.PAYER_ADDRESS ?? privateKeyToAccount(walletKey()).address
+  const { sets } = await chainBackups(owner)
+  const backups = backupsOnChain(sets, { sizeOf: pieceBytes, copies: config.providerIds?.length || config.copies || null })
+  const protect = [...(config.retention?.protect ?? []), ...String(process.env.RETAIN_PROTECT ?? '').split(/[\s,]+/)].filter(Boolean)
+  const plan = retirePlan(sets, backups, { providerIds: config.providerIds ?? [], copies: config.copies ?? null, protect })
+  for (const b of plan.blocked) log(`keep    data set ${b.dataSetId} (provider ${b.providerId}): ${b.why}`)
+  for (const r of plan.retire) log(`${yes ? 'ending ' : 'would end'} data set ${r.dataSetId} (provider ${r.providerId}, ${r.backups} backup(s) there)`)
+  if (!plan.ready) fail(`ending nothing: ${plan.why}`)
+  if (!plan.retire.length) return plan
+  if (!yes) {
+    log('pass --yes to end these data sets (irreversible: the provider drops them at the end epoch)')
+    return plan
+  }
+  const s = await synapse()
+  for (const r of plan.retire) {
+    const res = await s.storage.terminateService({ dataSetId: BigInt(r.dataSetId) })
+    log(`ended data set ${r.dataSetId}: ${res.txHash ?? res.confirmedTxHash ?? ''}, gone after epoch ${res.endEpoch}`)
+  }
   return plan
 }
 
@@ -1289,6 +1321,7 @@ const commands = {
   restore: () => restore(args[0], args[1]),
   prune: () => prune(args.includes('--yes')),
   retain: () => retain(args.includes('--yes')),
+  retire: () => retire(args.includes('--yes')),
   'session-login': () => sessionLogin(Number(args[0]), args[1]),
   'session-revoke': () => sessionRevoke(args[0]),
 }

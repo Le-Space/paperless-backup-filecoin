@@ -200,3 +200,44 @@ describe('calendar keys and the report', () => {
     assert.ok(lines.every((l) => !l.includes('cid-')))
   })
 })
+
+describe('ending data sets after a move to other providers', async () => {
+  const { retirePlan } = await import('../retention.mjs')
+  const sets = [
+    { dataSetId: '1', providerId: '36' },
+    { dataSetId: '2', providerId: '37' },
+    { dataSetId: '3', providerId: '43' },
+    { dataSetId: '4', providerId: '38' },
+  ]
+  const b = (pieceCid, date, ...dataSetIds) => ({ pieceCid, key: pieceCid, date, copies: dataSetIds.map((dataSetId) => ({ dataSetId })) })
+
+  it('ends nothing while the config names no providers', () => {
+    assert.equal(retirePlan(sets, [b('n', 3, '3', '4')], { providerIds: [] }).ready, false)
+  })
+
+  it('ends nothing until the newest backup is at the new providers', () => {
+    const p = retirePlan(sets, [b('n', 3, '1', '2', '3'), b('o', 1, '1', '2')], { providerIds: [43, 38] })
+    assert.equal(p.ready, false)
+    assert.deepEqual(p.retire, [])
+    assert.equal(p.blocked.length, 2)
+  })
+
+  it('ends the old providers’ data sets once the newest backup is at the new ones', () => {
+    const p = retirePlan(sets, [b('n', 3, '3', '4'), b('o', 1, '1', '2')], { providerIds: [43, 38] })
+    assert.equal(p.ready, true)
+    assert.deepEqual(p.retire, [{ dataSetId: '1', providerId: '36', backups: 1 }, { dataSetId: '2', providerId: '37', backups: 1 }])
+  })
+
+  it('takes the copies asked for, not every named provider', () => {
+    assert.equal(retirePlan(sets, [b('n', 3, '3')], { providerIds: [43, 38], copies: 1 }).ready, true)
+    assert.equal(retirePlan(sets, [b('n', 3, '3')], { providerIds: [43, 38] }).ready, false)
+  })
+
+  it('never ends a data set with the start backup or an undated one that only it holds', () => {
+    const p = retirePlan(sets, [b('n', 3, '3', '4'), b('start', 1, '1'), b('?', null, '2')], { providerIds: [43, 38], protect: ['start'] })
+    assert.deepEqual(p.retire, [])
+    assert.deepEqual(p.blocked.map((x) => [x.dataSetId, /started from/.test(x.why) ? 'start' : 'undated']), [['1', 'start'], ['2', 'undated']])
+    // Once the new providers hold them too, they no longer block.
+    assert.equal(retirePlan(sets, [b('n', 3, '3', '4'), b('start', 1, '1', '3')], { providerIds: [43, 38], protect: ['start'] }).retire.length, 2)
+  })
+})
