@@ -277,3 +277,45 @@ export function describePlan(plan) {
     ...plan.remove.map((b) => `remove  ${when(b.date)}  ${gib(b.size)}  ${b.complete ? '' : '(partial)'}`),
   ]
 }
+
+/**
+ * Which data sets to end after the backups moved to other providers for
+ * good: those at a provider the config no longer names. Nothing is ended
+ *   - unless the config names providers (`providerIds`);
+ *   - unless the newest backup is on chain at `copies` of the named
+ *     providers' data sets (default: as many as it names);
+ *   - while a data set holds a protected backup (the one a machine started
+ *     from) or a backup without a date that no named provider holds (it may
+ *     be newer than it looks).
+ * @param {Array<{ dataSetId: string, providerId: string }>} sets the account's live data sets
+ * @param {Array<{ pieceCid: string, key: string, date: number | null, copies: Array<{ dataSetId: string }> }>} backups as backupsOnChain returns them
+ * @param {{ providerIds: Array<number | string>, copies?: number | null, protect?: Iterable<string> }} o
+ * @returns {{ ready: boolean, why: string | null, retire: Array<{ dataSetId: string, providerId: string, backups: number }>, blocked: Array<{ dataSetId: string, providerId: string, why: string }> }}
+ */
+export function retirePlan(sets, backups, { providerIds, copies = null, protect = [] }) {
+  const named = new Set((providerIds ?? []).map(String))
+  if (!named.size) return { ready: false, why: 'the config names no providers (providerIds)', retire: [], blocked: [] }
+  const fresh = new Set(sets.filter((s) => named.has(String(s.providerId))).map((s) => String(s.dataSetId)))
+  const old = sets.filter((s) => !named.has(String(s.providerId)))
+  if (!old.length) return { ready: true, why: null, retire: [], blocked: [] }
+  const atFresh = (b) => b.copies.filter((c) => fresh.has(String(c.dataSetId))).length
+  const dated = backups.filter((b) => Number.isFinite(b.date)).sort((a, b) => b.date - a.date)
+  const newest = dated[0]
+  const want = copies > 0 ? copies : named.size
+  if (!newest || atFresh(newest) < want) {
+    return { ready: false, why: `the newest backup is not yet at ${want} of the named providers`, retire: [], blocked: old.map((s) => ({ dataSetId: String(s.dataSetId), providerId: String(s.providerId), why: 'newest backup not moved yet' })) }
+  }
+  const guard = new Set([...protect].map(String))
+  const isProtected = (b) => b.key.split(' ').some((c) => guard.has(c))
+  const retire = []
+  const blocked = []
+  for (const s of old) {
+    const id = String(s.dataSetId)
+    const here = backups.filter((b) => b.copies.some((c) => String(c.dataSetId) === id))
+    const only = (b) => atFresh(b) === 0
+    const why = here.some((b) => isProtected(b) && only(b)) ? 'holds the backup a machine started from, which no named provider holds' : here.some((b) => !Number.isFinite(b.date) && only(b)) ? 'holds an undated backup that no named provider holds' : null
+    if (why) blocked.push({ dataSetId: id, providerId: String(s.providerId), why })
+    else retire.push({ dataSetId: id, providerId: String(s.providerId), backups: here.length })
+  }
+  return { ready: true, why: null, retire, blocked }
+}
