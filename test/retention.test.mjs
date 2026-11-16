@@ -240,4 +240,10 @@ describe('ending data sets after a move to other providers', async () => {
     // Once the new providers hold them too, they no longer block.
     assert.equal(retirePlan(sets, [b('n', 3, '3', '4'), b('start', 1, '1', '3')], { providerIds: [43, 38], protect: ['start'] }).retire.length, 2)
   })
+
+  it('ends only the providers asked for, and never one still named', () => {
+    const p = retirePlan(sets, [b('n', 3, '3', '4'), b('o', 1, '1', '2')], { providerIds: [43, 38], only: [36] })
+    assert.deepEqual(p.retire.map((r) => r.providerId), ['36'])
+    assert.equal(retirePlan(sets, [b('n', 3, '3', '4')], { providerIds: [43, 38], only: [43] }).ready, false)
+  })
 })

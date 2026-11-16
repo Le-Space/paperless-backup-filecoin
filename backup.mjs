@@ -28,7 +28,8 @@
 //   node backup.mjs prune --yes     delete pieces older than keepWeeks (by the ledger)
 //   node backup.mjs retain [--yes]  keep the last N and one per day/week/month (config.retention),
 //                                   read from the chain; --yes schedules the removal of the rest
-//   node backup.mjs retire [--yes]  end (terminate) the data sets at providers the config no longer
+//   node backup.mjs retire [--providers 36,37] [--on-chain] [--yes]
+//                                   end (terminate) the data sets at providers the config no longer
 //                                   names, once the newest backup is at the named ones (wallet only)
 //   node backup.mjs session-login <hours> <key-file>   authorize a new session key (add pieces only)
 //   node backup.mjs session-revoke <address>           withdraw a session key
@@ -956,14 +957,14 @@ async function retain(yes) {
 // with the wallet: Le Space ends its own data sets, and a session key may
 // not. Nothing ends before the newest backup is on chain at the named
 // providers, nor a data set that alone holds the start backup or an undated one.
-async function retire(yes) {
+async function retire(yes, { only = null, onChain = false } = {}) {
   if (REMOTE) fail('with the remote signer, Le Space ends its data sets; retire is for the wallet')
   if (process.env.SESSION_KEY_FILE) fail('a session key may not end data sets; run retire with the wallet')
   const owner = config.payer ?? process.env.PAYER_ADDRESS ?? privateKeyToAccount(walletKey()).address
   const { sets } = await chainBackups(owner)
   const backups = backupsOnChain(sets, { sizeOf: pieceBytes, copies: config.providerIds?.length || config.copies || null })
   const protect = [...(config.retention?.protect ?? []), ...String(process.env.RETAIN_PROTECT ?? '').split(/[\s,]+/)].filter(Boolean)
-  const plan = retirePlan(sets, backups, { providerIds: config.providerIds ?? [], copies: config.copies ?? null, protect })
+  const plan = retirePlan(sets, backups, { providerIds: config.providerIds ?? [], copies: config.copies ?? null, protect, only })
   for (const b of plan.blocked) log(`keep    data set ${b.dataSetId} (provider ${b.providerId}): ${b.why}`)
   for (const r of plan.retire) log(`${yes ? 'ending ' : 'would end'} data set ${r.dataSetId} (provider ${r.providerId}, ${r.backups} backup(s) there)`)
   if (!plan.ready) fail(`ending nothing: ${plan.why}`)
@@ -974,7 +975,10 @@ async function retire(yes) {
   }
   const s = await synapse()
   for (const r of plan.retire) {
-    const res = await s.storage.terminateService({ dataSetId: BigInt(r.dataSetId) })
+    // Normally through the provider (it ends its side and settles). With
+    // --on-chain the wallet ends the payment on chain alone, also when the
+    // provider does not answer: the rail then winds down over its lockup period.
+    const res = await s.storage.terminateService({ dataSetId: BigInt(r.dataSetId), ...(onChain ? { skipProvider: true } : {}) })
     log(`ended data set ${r.dataSetId}: ${res.txHash ?? res.confirmedTxHash ?? ''}, gone after epoch ${res.endEpoch}`)
   }
   return plan
@@ -1321,7 +1325,12 @@ const commands = {
   restore: () => restore(args[0], args[1]),
   prune: () => prune(args.includes('--yes')),
   retain: () => retain(args.includes('--yes')),
-  retire: () => retire(args.includes('--yes')),
+  retire: () => {
+    const at = args.indexOf('--providers')
+    const only = at >= 0 ? String(args[at + 1] ?? '').split(',').filter(Boolean) : null
+    if (at >= 0 && !only.length) fail('usage: node backup.mjs retire [--providers 36,37] [--on-chain] [--yes]')
+    return retire(args.includes('--yes'), { only, onChain: args.includes('--on-chain') })
+  },
   'session-login': () => sessionLogin(Number(args[0]), args[1]),
   'session-revoke': () => sessionRevoke(args[0]),
 }

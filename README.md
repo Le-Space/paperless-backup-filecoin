@@ -96,7 +96,7 @@ Step-by-step setup: [HOWTO.txt](HOWTO.txt). Auf Deutsch: [ANLEITUNG.txt](ANLEITU
 | `node backup.mjs restore <pieceCid> [out.zip]` | download, check, decrypt (a backup in parts: by its first part's piece CID) |
 | `node backup.mjs prune --yes` | delete backups older than `keepWeeks` (the newest complete one always stays) |
 | `node backup.mjs retain [--yes]` | keep the last N and one per day, week and month (`retention`), read from the chain; `--yes` schedules the removal of the rest (see [Retention](#retention)) |
-| `node backup.mjs retire [--yes]` | end the data sets at providers `providerIds` no longer names, once the newest backup is on chain at the named ones (wallet only; see [Retention](#retention)) |
+| `node backup.mjs retire [--providers 36,37] [--on-chain] [--yes]` | end the data sets at providers `providerIds` no longer names, once the newest backup is on chain at the named ones (wallet only; see [Retention](#retention)) |
 | `node backup.mjs mail-from-paperless` / `mail-check` / `mail-test` / `mail-preview` | take the SMTP login from a Paperless mail account; check the login; send a test report; print the report (and a low-funds and a failure example) without sending |
 | `node backup.mjs daily` | once a day: back up if Paperless changed, verify, prune, mail a report; catches up if the machine was off |
 | `node backup.mjs session-login <hours> <key-file>` | with the wallet: create a session key that may create data sets and add pieces until it expires (at most 168 h), and write it to `<key-file>` |
@@ -211,3 +211,5 @@ Without `--yes` it only prints the plan (date, size, why). With `--yes` it sched
 ### Moving to other providers
 
 After `providerIds` changed for good, the data sets at the old providers keep costing. `retire` ends them (terminate: the provider keeps a data set until its end epoch, then drops it). It ends nothing while the config names no providers or the newest backup is not yet on chain at `copies` of the named providers, and it keeps a data set that alone holds a protected backup or an undated one. Without `--yes` it prints what it would end. Only the wallet can end data sets: not a session key, and not the remote signer, where Le Space ends its own.
+
+`--providers 36,37` ends only the data sets at those providers (others the config dropped stay, e.g. an older copy kept as a fallback). Normally `retire` asks the provider to end its side; a provider that does not answer fails that. `--on-chain` ends the payment on chain with the wallet alone (synapse's `skipProvider`): the rail then winds down over its lockup period, and the wallet needs FIL for the transaction.
