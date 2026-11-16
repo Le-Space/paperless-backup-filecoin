@@ -95,6 +95,7 @@ Step-by-step setup: [HOWTO.txt](HOWTO.txt). Auf Deutsch: [ANLEITUNG.txt](ANLEITU
 | `node backup.mjs list` | stored backups |
 | `node backup.mjs restore <pieceCid> [out.zip]` | download, check, decrypt (a backup in parts: by its first part's piece CID) |
 | `node backup.mjs prune --yes` | delete backups older than `keepWeeks` (the newest complete one always stays) |
+| `node backup.mjs retain [--yes]` | keep the last N and one per day, week and month (`retention`), read from the chain; `--yes` schedules the removal of the rest (see [Retention](#retention)) |
 | `node backup.mjs mail-from-paperless` / `mail-check` / `mail-test` / `mail-preview` | take the SMTP login from a Paperless mail account; check the login; send a test report; print the report (and a low-funds and a failure example) without sending |
 | `node backup.mjs daily` | once a day: back up if Paperless changed, verify, prune, mail a report; catches up if the machine was off |
 | `node backup.mjs session-login <hours> <key-file>` | with the wallet: create a session key that may create data sets and add pieces until it expires (at most 168 h), and write it to `<key-file>` |
@@ -108,6 +109,7 @@ Step-by-step setup: [HOWTO.txt](HOWTO.txt). Auf Deutsch: [ANLEITUNG.txt](ANLEITU
 | `copies` | number of providers when `providerIds` is empty |
 | `providerIds` | explicit provider ids; still checked against `regions` |
 | `keepWeeks` | how long `prune` keeps backups |
+| `retention` | what `retain` keeps: `keepLast`, `keepDays`, `keepWeeks`, `keepMonths`, optional `maxBytes` (a quota per data set) and `protect` (piece CIDs); defaults per network in `retention.mjs` |
 | `daily` | `time` (when the day's run is due), `fullEveryDays` (upload even without changes), `prune`, `warnRunwayDays` |
 | `mail` | SMTP `host`, `port`, `user`, `from`, `to`, and `language` (`en` or `de`) for the daily report; password in the keychain (`paperless-backup-smtp`) or `SMTP_PASSWORD_FILE` |
 | `network` | `mainnet` or `calibration` (testnet) |
@@ -187,3 +189,20 @@ Tests: `npm test` runs the remote signer against a mocked service that checks ea
 Copyright © 2026 [Le Space](https://github.com/Le-Space).
 
 Free software under the **GNU Affero General Public License, version 3 or later** (`AGPL-3.0-or-later`), see [LICENSE](LICENSE).
+
+## Retention
+
+Nothing removes old pieces on its own, so data sets only grow. `retain` reads this account's data sets from the chain (not the ledger, so it also sees backups that other machines made) and keeps:
+
+- the newest complete backup (complete: held by as many data sets as the config asks copies for);
+- the backups whose piece CIDs are in `retention.protect` or `RETAIN_PROTECT` (the one a machine was restored from);
+- the newest backup of every data set, so that a backup on another provider stays when the providers of the newer ones are down;
+- the last `keepLast` backups;
+- per UTC day of the last `keepDays` days, ISO week of the last `keepWeeks` weeks and month of the last `keepMonths` months, the newest backup (a complete one first);
+- every backup whose date is unknown.
+
+With `maxBytes` the ones kept only for a day, week or month go, oldest first, until the kept ones and room for one more backup as large as the newest fit.
+
+The chain keeps no date per piece. `retain` takes them from the PDP explorer's subgraph (when each piece was added; `RETAIN_DATES_URL` overrides it) and drops a data set's dates if they go against its piece order. Without an answer, backups count as undated and stay.
+
+Without `--yes` it only prints the plan (date, size, why). With `--yes` it schedules the removals, one `SchedulePieceRemovals` per data set with every part of every copy, and marks those ledger entries deleted. Removal needs the wallet or the remote signer; with a session key `retain --yes` only plans. A provider carries a removal out at its next proving step, so the data set shrinks with a delay (on mainnet up to a day). `RETAIN_REPORT=<file>` writes the plan as JSON.
