@@ -4,6 +4,12 @@
   "copies": 3,
   "providerIds": [],
   "keepWeeks": 12,
+  "retention": {
+    "keepLast": 3,
+    "keepDays": 7,
+    "keepWeeks": 4,
+    "keepMonths": 6
+  },
   "datasetMetadata": {
     "app": "paperless-backup"
   },

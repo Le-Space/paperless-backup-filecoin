@@ -25,7 +25,9 @@
 //   node backup.mjs list            what the ledger holds
 //   node backup.mjs verify          is every copy still in its data set?
 //   node backup.mjs restore <pieceCid> [out.zip]   (the first part's, for a backup in parts)
-//   node backup.mjs prune --yes     delete pieces older than keepWeeks
+//   node backup.mjs prune --yes     delete pieces older than keepWeeks (by the ledger)
+//   node backup.mjs retain [--yes]  keep the last N and one per day/week/month (config.retention),
+//                                   read from the chain; --yes schedules the removal of the rest
 //   node backup.mjs session-login <hours> <key-file>   authorize a new session key (add pieces only)
 //   node backup.mjs session-revoke <address>           withdraw a session key
 //   node backup.mjs daily           once a day: back up if Paperless changed, verify, prune, mail
@@ -44,7 +46,7 @@ import { fileURLToPath } from 'node:url'
 import { Decrypter, Encrypter, generateX25519Identity, identityToRecipient } from 'age-encryption'
 import { Synapse, TOKENS, calibration, formatUnits, mainnet } from '@filoz/synapse-sdk'
 import { getPDPProvidersByIds } from '@filoz/synapse-core/sp-registry'
-import { getApprovedProviderIds } from '@filoz/synapse-core/warm-storage'
+import { getApprovedProviderIds, getPdpDataSets } from '@filoz/synapse-core/warm-storage'
 import { getEndorsedProviderIds } from '@filoz/synapse-core/endorsements'
 import * as SessionKey from '@filoz/synapse-core/session-key'
 import { createClient, createPublicClient, createWalletClient, http } from 'viem'
@@ -52,6 +54,9 @@ import { getTransport } from '@filoz/synapse-core/client'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import nodemailer from 'nodemailer'
 import { PART_BYTES, copyPieceIds, copyUrls, entryParts, isMultipart, missingParts, partHasher, partRanges, pieceFields, reassemble, uploadParts } from './parts.mjs'
+import { tryFrom as pieceFrom } from '@filoz/synapse-core/piece'
+import { dataSetLive, getActivePiecesByCursor, getScheduledRemovals } from '@filoz/synapse-core/pdp-verifier'
+import { backupsOnChain, consistentDates, describePlan, planRetention, removalsByDataSet, retentionPolicy } from './retention.mjs'
 import { backupMetadata, checkConfig, createRemoteSigner, dataSetState, ownDataSetsOf, parseBackupKey, payerAccount } from './remote-signer.mjs'
 import { Agent, setGlobalDispatcher } from 'undici'
 
@@ -813,6 +818,136 @@ async function prune(yes) {
   return old
 }
 
+// --- retention ----------------------------------------------------------------
+
+// When each piece was added: the PDP explorer's subgraph (FilOzone), read
+// only; the chain itself keeps no date per piece. Checked against the piece
+// order (consistentDates); without an answer every backup counts as undated
+// and stays.
+const SUBGRAPH = {
+  mainnet: 'https://api.goldsky.com/api/public/project_cmr0lp7u23a7d01w7bxeef1fj/subgraphs/pdp-explorer-mainnet/prod/gn',
+  calibration: 'https://api.goldsky.com/api/public/project_cmr0lp7u23a7d01w7bxeef1fj/subgraphs/pdp-explorer-calibration/prod/gn',
+}
+
+async function pieceDates(dataSetId) {
+  const url = process.env.RETAIN_DATES_URL ?? SUBGRAPH[config.network === 'calibration' ? 'calibration' : 'mainnet']
+  const dates = new Map()
+  let after = '-1'
+  try {
+    for (let page = 0; page < 50; page++) {
+      const query = `{ roots(first: 1000, orderBy: rootId, orderDirection: asc, where: { setId: "${BigInt(dataSetId)}", rootId_gt: "${after}" }) { rootId createdAt } }`
+      const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query }), signal: AbortSignal.timeout(30_000) })
+      const roots = (await res.json())?.data?.roots
+      if (!Array.isArray(roots)) throw new Error(`no roots in the answer (HTTP ${res.status})`)
+      for (const r of roots) dates.set(String(r.rootId), Number(r.createdAt) * 1000)
+      if (roots.length < 1000) break
+      after = roots.at(-1).rootId
+    }
+  } catch (err) {
+    log(`no piece dates for data set ${dataSetId} (${err.message}); its backups count as undated and stay`)
+    return new Map()
+  }
+  return dates
+}
+
+const pieceBytes = (cid) => pieceFrom(cid)?.size ?? null
+
+/**
+ * The backups this account's data sets hold, read from the chain with plain
+ * read calls (no key): the owner's live data sets that have not ended and
+ * carry this backup's label (and, with the remote signer, this account's
+ * tag), their active pieces without those already scheduled for removal.
+ */
+async function chainBackups(owner) {
+  const client = createPublicClient({ chain, transport: http() })
+  const all = []
+  let cursor
+  for (let page = 0; page < 100; page++) {
+    const { items, nextCursor } = await getPdpDataSets(client, { address: owner, ...(cursor == null ? {} : { cursor }) })
+    all.push(...items)
+    if (nextCursor == null) break
+    cursor = nextCursor
+  }
+  const label = REMOTE ? REMOTE.label : config.datasetMetadata?.app
+  const mine = all.filter((ds) => BigInt(ds.pdpEndEpoch ?? 0n) === 0n && ds.metadata?.app === label && (!REMOTE || ds.metadata?.customer === REMOTE.tag))
+  const read = []
+  const scheduled = new Map()
+  for (const ds of mine) {
+    const dataSetId = BigInt(ds.dataSetId)
+    if (!(await dataSetLive(client, { dataSetId }))) continue
+    const id = String(dataSetId)
+    const gone = new Set((await getScheduledRemovals(client, { dataSetId })).map(String))
+    scheduled.set(id, gone)
+    const dates = await pieceDates(id)
+    const pieces = []
+    let start
+    for (let page = 0; page < 100; page++) {
+      const { items, nextCursor } = await getActivePiecesByCursor(client, { dataSetId, ...(start == null ? {} : { cursor: start }) })
+      for (const p of items) if (!gone.has(String(p.id))) pieces.push({ pieceId: BigInt(p.id), pieceCid: p.cid.toString(), date: dates.get(String(p.id)) ?? null })
+      if (nextCursor == null) break
+      start = nextCursor
+    }
+    read.push({ dataSetId: id, pieces: consistentDates(pieces) })
+  }
+  return { sets: read, scheduled }
+}
+
+async function retain(yes) {
+  // A session key may not remove pieces: it plans and reports, the wallet removes.
+  const sessionOnly = Boolean(process.env.SESSION_KEY_FILE && !REMOTE)
+  if (yes && sessionOnly) {
+    log('a session key may not remove pieces: planning only; run `retain --yes` with the wallet to remove')
+    yes = false
+  }
+  const policy = retentionPolicy(config.retention, config.network === 'calibration' ? 'calibration' : 'mainnet')
+  // The backup the running machine came from (paperless-anywhere: the restore entry's piece CIDs).
+  const protect = [...(config.retention?.protect ?? []), ...String(process.env.RETAIN_PROTECT ?? '').split(/[\s,]+/)].filter(Boolean)
+  // Whose data sets: the payer's (remote signer, session key), else the wallet's.
+  const owner = REMOTE?.payer ?? config.payer ?? process.env.PAYER_ADDRESS ?? privateKeyToAccount(walletKey()).address
+  const { sets, scheduled } = await chainBackups(owner)
+  // Complete with the copies the config asks for (providerIds, else copies).
+  const backups = backupsOnChain(sets, { sizeOf: pieceBytes, copies: config.providerIds?.length || config.copies || null })
+  const plan = planRetention(backups, policy, { now: Date.now(), protect })
+  for (const line of describePlan(plan)) log(line)
+  if (plan.overBudget) log('WARNING: what must stay does not leave room for another backup within retention.maxBytes')
+  const report = (sent) => ({
+    at: new Date().toISOString(),
+    policy,
+    keep: plan.keep.map((b) => ({ pieceCid: b.pieceCid, date: b.date, size: b.size, complete: b.complete, reasons: b.reasons })),
+    remove: plan.remove.map((b) => ({ pieceCid: b.pieceCid, date: b.date, size: b.size, complete: b.complete })),
+    scheduledPieces: [...scheduled.values()].reduce((n, ids) => n + ids.size, 0),
+    needsWallet: sessionOnly,
+    keptBytes: plan.keptBytes,
+    overBudget: plan.overBudget,
+    sent,
+  })
+  const write = (r) => process.env.RETAIN_REPORT && writeFileSync(process.env.RETAIN_REPORT, JSON.stringify(r) + '\n')
+  // Never on a chain view without a complete backup: something is off.
+  if (!plan.keep.some((b) => b.reasons.includes('newest'))) {
+    write(report(false))
+    fail('no complete backup on chain; removing nothing')
+  }
+  if (!plan.remove.length || !yes) {
+    if (plan.remove.length) log('pass --yes to schedule these removals (irreversible once the provider proves the next period)')
+    write(report(false))
+    return plan
+  }
+  const s = await synapse()
+  for (const [dataSetId, ids] of removalsByDataSet(plan.remove, scheduled)) {
+    const ctx = await s.storage.createContext({ dataSetId: BigInt(dataSetId) })
+    const tx = await ctx.deletePieces({ pieces: ids })
+    log(`scheduled the removal of ${ids.length} piece(s) in data set ${dataSetId}: ${tx}`)
+  }
+  // The ledger follows: what was removed is marked deleted.
+  const gone = new Set(plan.remove.flatMap((b) => b.key.split(' ')))
+  const ledger = readLedger()
+  let changed = false
+  for (const e of ledger) if (!e.deleted && entryParts(e).every((p) => gone.has(p.pieceCid))) changed = e.deleted = true
+  if (changed) writeLedger(ledger)
+  write(report(true))
+  return plan
+}
+
 // --- daily ------------------------------------------------------------------
 
 function readState() {
@@ -1153,6 +1288,7 @@ const commands = {
   'mail-preview': mailPreview,
   restore: () => restore(args[0], args[1]),
   prune: () => prune(args.includes('--yes')),
+  retain: () => retain(args.includes('--yes')),
   'session-login': () => sessionLogin(Number(args[0]), args[1]),
   'session-revoke': () => sessionRevoke(args[0]),
 }
