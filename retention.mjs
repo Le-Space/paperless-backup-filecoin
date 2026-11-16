@@ -289,14 +289,17 @@ export function describePlan(plan) {
  *     be newer than it looks).
  * @param {Array<{ dataSetId: string, providerId: string }>} sets the account's live data sets
  * @param {Array<{ pieceCid: string, key: string, date: number | null, copies: Array<{ dataSetId: string }> }>} backups as backupsOnChain returns them
- * @param {{ providerIds: Array<number | string>, copies?: number | null, protect?: Iterable<string> }} o
+ * `only`: end data sets at these providers only (others the config dropped stay).
+ * @param {{ providerIds: Array<number | string>, copies?: number | null, protect?: Iterable<string>, only?: Array<number | string> | null }} o
  * @returns {{ ready: boolean, why: string | null, retire: Array<{ dataSetId: string, providerId: string, backups: number }>, blocked: Array<{ dataSetId: string, providerId: string, why: string }> }}
  */
-export function retirePlan(sets, backups, { providerIds, copies = null, protect = [] }) {
+export function retirePlan(sets, backups, { providerIds, copies = null, protect = [], only = null }) {
   const named = new Set((providerIds ?? []).map(String))
   if (!named.size) return { ready: false, why: 'the config names no providers (providerIds)', retire: [], blocked: [] }
   const fresh = new Set(sets.filter((s) => named.has(String(s.providerId))).map((s) => String(s.dataSetId)))
-  const old = sets.filter((s) => !named.has(String(s.providerId)))
+  const picked = only?.length ? new Set(only.map(String)) : null
+  if (picked && [...picked].some((p) => named.has(p))) return { ready: false, why: 'a provider to end is still named in providerIds', retire: [], blocked: [] }
+  const old = sets.filter((s) => !named.has(String(s.providerId)) && (!picked || picked.has(String(s.providerId))))
   if (!old.length) return { ready: true, why: null, retire: [], blocked: [] }
   const atFresh = (b) => b.copies.filter((c) => fresh.has(String(c.dataSetId))).length
   const dated = backups.filter((b) => Number.isFinite(b.date)).sort((a, b) => b.date - a.date)
