@@ -818,14 +818,17 @@ async function runSnapshot({ force = false } = {}) {
 // One part of a pack fetched into `file`: synapse first, then each URL;
 // checked against its piece CID (and size and SHA-256 when known).
 async function fetchPart(s, part, urls, file) {
+  // The copies' URLs first (one request each; the piece CID is checked here),
+  // synapse last: it looks the providers up on chain for every piece, which
+  // for a generation of many small packs costs minutes.
   const tries = []
-  if (s) tries.push(async () => Buffer.from(await s.storage.download({ pieceCid: part.pieceCid })))
   for (const url of urls ?? []) tries.push(async () => {
     const res = await fetch(url)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     await pipeline(Readable.fromWeb(res.body), createWriteStream(file, { mode: 0o600 }))
     return null
   })
+  if (s) tries.push(async () => Buffer.from(await s.storage.download({ pieceCid: part.pieceCid })))
   for (const attempt of tries) {
     try {
       const bytes = await attempt()
