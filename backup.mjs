@@ -44,7 +44,7 @@
 
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { Readable, Transform, Writable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { platform } from 'node:os'
@@ -63,12 +63,11 @@ import nodemailer from 'nodemailer'
 import { PART_BYTES, copyPieceIds, copyUrls, entryParts, isMultipart, missingParts, partHasher, partRanges, pieceFields, reassemble, uploadParts } from './parts.mjs'
 import { tryFrom as pieceFrom } from '@filoz/synapse-core/piece'
 import { dataSetLive, getActivePiecesByCursor, getScheduledRemovals } from '@filoz/synapse-core/pdp-verifier'
-import { backupsOnChain, consistentDates, describePlan, planRetention, removalsByDataSet, retentionPolicy, retirePlan } from './retention.mjs'
+import { backupsOnChain, consistentDates, describePlan, groupPieces, planRetention, removalsByDataSet, retentionPolicy, retirePlan } from './retention.mjs'
 import { backupMetadata, checkConfig, createRemoteSigner, dataSetState, ownDataSetsOf, parseBackupKey, payerAccount } from './remote-signer.mjs'
 import { Agent, setGlobalDispatcher } from 'undici'
-import { ByteReader, EXPORTER_ARGS, dedupKeyFrom, emptyState, incrementalConfig, keyCheck, missingPieces, nextState, packStream, parsePieceMetadata, pieceMetadata, planSnapshot, readHeader, rebaseReason, restoreSnapshot, scanFiles, stateFromRestore } from './snapshot.mjs'
+import { ByteReader, EXPORTER_ARGS, PREFIX_BYTES, classifyPrefix, dedupKeyFrom, emptyState, incrementalConfig, missingPieces, nextState, packPrefix, packStream, pieceMetadata, planSnapshot, readHeader, rebaseReason, restoreSnapshot, scanFiles, stateFromRestore } from './snapshot.mjs'
 import { uploadPack } from './pack-upload.mjs'
-import { readPieceMetadata } from './piece-metadata.mjs'
 import { calculate as pieceCidOf } from '@filoz/synapse-core/piece'
 
 // A provider answers an upload only after it has hashed the whole piece, which
@@ -724,7 +723,12 @@ async function sealPack(plan) {
     const e = new Encrypter()
     e.addRecipient(config.ageRecipient)
     const sealedStream = await e.encrypt(Readable.toWeb(Readable.from(packStream(plan, { pad: INCREMENTAL.padBytes }))))
-    await pipeline(Readable.fromWeb(sealedStream), hashing(sealedHash), partHashes.stream, createWriteStream(sealedPath, { mode: 0o600 }))
+    // The public prefix (generation, number), then the age stream.
+    const prefixed = async function* () {
+      yield packPrefix(plan)
+      for await (const chunk of Readable.fromWeb(sealedStream)) yield chunk
+    }
+    await pipeline(Readable.from(prefixed()), hashing(sealedHash), partHashes.stream, createWriteStream(sealedPath, { mode: 0o600 }))
     const sealedBytes = statSync(sealedPath).size
     const ranges = partRanges(sealedBytes, PART_BYTES)
     const partSha256 = partHashes.digests()
@@ -814,14 +818,17 @@ async function runSnapshot({ force = false } = {}) {
 // One part of a pack fetched into `file`: synapse first, then each URL;
 // checked against its piece CID (and size and SHA-256 when known).
 async function fetchPart(s, part, urls, file) {
+  // The copies' URLs first (one request each; the piece CID is checked here),
+  // synapse last: it looks the providers up on chain for every piece, which
+  // for a generation of many small packs costs minutes.
   const tries = []
-  if (s) tries.push(async () => Buffer.from(await s.storage.download({ pieceCid: part.pieceCid })))
   for (const url of urls ?? []) tries.push(async () => {
     const res = await fetch(url)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     await pipeline(Readable.fromWeb(res.body), createWriteStream(file, { mode: 0o600 }))
     return null
   })
+  if (s) tries.push(async () => Buffer.from(await s.storage.download({ pieceCid: part.pieceCid })))
   for (const attempt of tries) {
     try {
       const bytes = await attempt()
@@ -884,9 +891,20 @@ async function restoreSnapshotEntry(entry, outDir, { adopt = false, packsDir = n
       log(`pack ${p.seq}/${entry.seq}: fetched and checked`)
     }
     const open = async (seq) => {
+      // The prefix must name this pack; the age stream follows it.
+      const path = sealedOf.get(seq)
+      const head = Buffer.alloc(PREFIX_BYTES)
+      const fd = openSync(path, 'r')
+      try {
+        readSync(fd, head, 0, PREFIX_BYTES, 0)
+      } finally {
+        closeSync(fd)
+      }
+      const said = classifyPrefix(head)
+      if (!said || said === 'full' || said.gen !== entry.gen || said.seq !== seq) fail(`pack ${seq} does not start with its own prefix`)
       const d = new Decrypter()
       d.addIdentity(identity)
-      return Readable.fromWeb(await d.decrypt(fileStream(sealedOf.get(seq))))
+      return Readable.fromWeb(await d.decrypt(Readable.toWeb(createReadStream(path, { start: PREFIX_BYTES }))))
     }
     const head = new ByteReader(await open(entry.seq))
     const target = await readHeader(head)
@@ -1187,13 +1205,55 @@ async function chainBackups(owner) {
       if (nextCursor == null) break
       start = nextCursor
     }
-    // Snapshot packs say so in their piece metadata (pa, gen, seq). A read
-    // that fails fails `retain`: it removes nothing it cannot place.
-    const meta = await readPieceMetadata(client, chain.contracts.fwss.address, dataSetId, pieces.map((p) => p.pieceId), ['pa', 'gen', 'seq'])
-    for (const p of pieces) p.snapshot = parsePieceMetadata(meta.get(String(p.pieceId)))
     read.push({ dataSetId: id, providerId: String(ds.providerId), pieces: consistentDates(pieces) })
   }
+  await markSnapshots(client, read)
   return { sets: read, scheduled }
+}
+
+// Which pieces are snapshot packs: the first bytes of each backup's first
+// piece (PA-SNAP/1 gen seq, or age's header for a full backup), read with an
+// HTTP range request from any data set that holds it, and kept in a cache
+// (pieces never change). A piece no provider answers for fails `retain`: it
+// removes nothing it cannot place.
+const KIND_CACHE = process.env.PIECE_KINDS ?? join(HERE, config.network === 'calibration' ? 'piece-kinds.calibration.json' : 'piece-kinds.json')
+async function markSnapshots(client, sets) {
+  const cache = existsSync(KIND_CACHE) ? JSON.parse(readFileSync(KIND_CACHE, 'utf8')) : {}
+  const providerIds = [...new Set(sets.map((ds) => BigInt(ds.providerId)))]
+  const providers = providerIds.length ? await getPDPProvidersByIds(client, { providerIds }) : []
+  const baseOf = (id) => providers.find((p) => String(p.id) === String(id))?.pdp?.serviceURL?.replace(/\/+$/, '')
+  const holders = new Map()
+  for (const ds of sets) for (const p of ds.pieces) holders.set(p.pieceCid, [...(holders.get(p.pieceCid) ?? []), baseOf(ds.providerId)].filter(Boolean))
+  let changed = false
+  const kindOf = async (cid) => {
+    if (cache[cid]) return cache[cid]
+    for (const base of holders.get(cid) ?? []) {
+      try {
+        const res = await fetch(`${base}/piece/${cid}`, { headers: { range: `bytes=0-${PREFIX_BYTES - 1}` }, signal: AbortSignal.timeout(30_000) })
+        if (!res.ok) continue
+        const said = classifyPrefix(new Uint8Array(await res.arrayBuffer()).subarray(0, PREFIX_BYTES))
+        if (!said) continue
+        cache[cid] = said
+        changed = true
+        return said
+      } catch {}
+    }
+    throw new Error(`no provider told what piece ${cid} is; removing nothing`)
+  }
+  try {
+    for (const ds of sets) {
+      for (const run of groupPieces(ds.pieces, pieceBytes)) {
+        const kind = await kindOf(run[0].pieceCid)
+        if (kind === 'full') continue
+        run.forEach((r, part) => {
+          const p = ds.pieces.find((x) => x.pieceCid === r.pieceCid && BigInt(x.pieceId) === BigInt(r.pieceId))
+          p.snapshot = { gen: kind.gen, seq: kind.seq, part, parts: run.length }
+        })
+      }
+    }
+  } finally {
+    if (changed) writeFileSync(KIND_CACHE, JSON.stringify(cache) + '\n')
+  }
 }
 
 async function retain(yes) {

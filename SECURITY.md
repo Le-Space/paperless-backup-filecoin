@@ -48,6 +48,7 @@ Encryption hides the content. It does not hide that backups happen. On the publi
 - **when** a piece was added, its **size**, its **PieceCID**, and **which providers** hold it;
 - the **data set metadata** (`datasetMetadata`, default `{"app": "paperless-backup"}`) and the SDK's `source` tag `paperless-backup`;
 - deposits, rates and how long the deposit lasts.
+- with incremental backups (`incremental.enabled`): the first 64 bytes of each pack, `PA-SNAP/1 <generation> <number>`, which are not encrypted. They tell that a piece is an incremental backup, which pieces form one generation and how many additions it has. The generation id is random. File names, file ids and how many documents a pack holds stay inside the age stream, and packs are padded to whole MiB.
 
 So an observer can tell that some wallet backs up roughly this much data, this often, to these providers. If that matters, change `datasetMetadata`, and do not link the wallet address to your name. Anyone can download the encrypted pieces; without the age identity they are random bytes.
 

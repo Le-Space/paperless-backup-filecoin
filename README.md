@@ -179,7 +179,9 @@ Off by default. With `"incremental": { "enabled": true }` in `config.json`, `run
 - `run` scans that folder. Every file gets an id: HMAC-SHA256 with a dedup key over its SHA-256.
 - The files whose id the current *generation* does not hold yet go into one *pack*, together with the whole snapshot's index. The pack is padded to whole MiB and sealed with age to `ageRecipient`, as always.
 - The pack is one piece, a baseline above 1 GB in parts.
-- Each piece carries public metadata: `pa=snap/1`, `gen` (random) and `seq` (0 is the baseline). File ids and names stay inside the age stream.
+- The sealed pack starts with a public 64-byte prefix, `PA-SNAP/1 <gen> <seq>`: `gen` is random, `seq` 0 is the baseline. The age stream follows it. File ids and names stay inside the age stream.
+- The pieces also carry `pa`/`gen`/`seq` as piece metadata, but Warm Storage keeps that only in its `PieceAdded` event, not in its state. The prefix is what can be read back at any time.
+- **The prefix is public:** anyone who fetches a piece's first bytes learns that it is an incremental backup, its generation and its number. Nothing about the documents. See [docs/incremental-backups.md](docs/incremental-backups.md).
 - **A new generation** (a full baseline) starts when:
   - there is none;
   - it is `rebaseDays` old (30);
@@ -203,7 +205,9 @@ Off by default. With `"incremental": { "enabled": true }` in `config.json`, `run
 
 **Retention**
 
-- `retain` reads each piece's metadata from the chain. Warm Storage stores it but its view has no getter, so it is read from storage slots with `extsload`; see [piece-metadata.mjs](piece-metadata.mjs).
+- `retain` reads the first 64 bytes of each backup's first piece with an HTTP range request, from any provider holding it, to tell packs from full backups.
+- The answer is cached per piece CID in `piece-kinds.json` (`PIECE_KINDS`), since pieces never change.
+- A piece no provider answers for makes `retain` remove nothing.
 - It keeps every pack that a kept snapshot builds on, so in practice old generations go as a whole.
 - While snapshots are on chain and `incremental.restoreVerified` is not `true`, full backups of the old kind all stay (`legacy`).
 - `prune` leaves snapshots alone.

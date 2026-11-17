@@ -146,7 +146,7 @@ Sources: `@filoz/synapse-core` 0.10.0 and `synapse-sdk` 2.0.2 in `node_modules`,
 **Piece metadata.**
 
 - At most 3 keys per piece, keys up to 32 bytes, values up to 96 bytes.
-- Stored on chain, public, and signed by the client. It is cleared when the piece is removed.
+- Public and signed by the client. **Correction after the calibration trial (2026-11-17):** current Warm Storage no longer keeps piece metadata in its state; it only emits it in the `PieceAdded` event. Old data sets still have it in storage (legacy layout), new ones do not. Reading events over a data set's whole life is too fragile with public RPC limits, so the design uses a public prefix in the piece itself (below).
 - `storage.upload(…, { pieceMetadata })` exists in sdk 2.0.2.
 
 **Copies.** The primary stores a piece once. The other providers pull it (`/pdp/piece/pull`) into their own data sets, and each copy pays its own AddPieces fees.
@@ -180,7 +180,8 @@ Both options share these parts:
    - the bytes of the new blobs.
 4. Pad the pack up to the next multiple of 1 MiB, so its size does not tell how many documents were added.
 5. Upload the pack as one piece, the same way as today: primary, pulls, one AddPieces per data set. Use `PART_BYTES` parts if it is larger (only the baseline).
-   - Piece metadata (public, 3 keys): `pa=snap/1`, `gen=<random 16 hex>`, `seq=<n>`.
+   - **The sealed pack starts with a public 64-byte prefix before the age stream:** `PA-SNAP/1 <gen> <seq>`, padded with spaces and ending in a newline. `gen` is 16 random hex; `seq` 0 is the baseline. `retain` and the app read it with an HTTP range request (bytes 0–63) from any provider holding the piece, and cache the answer per piece CID. A full backup of the old kind starts with age's own header instead.
+   - The pieces also carry the same values as piece metadata (`pa=snap/1`, `gen`, `seq`), which only reaches the `PieceAdded` event.
 6. **Rebase**, meaning a new generation starting with a full baseline pack, when any of these holds:
    - the generation is older than 30 days;
    - its incremental bytes exceed 30 % of the baseline;
@@ -189,9 +190,10 @@ Both options share these parts:
 
 **What the providers and the public can see**
 
+- **The prefix of every pack: its generation and its number in it.** Anyone can fetch the first 64 bytes of a piece, since pieces are publicly retrievable. So anyone can tell that a piece is an incremental backup, which pieces form one generation, how many additions it has, and which piece is its baseline. The piece metadata in the `PieceAdded` event says the same.
+- The generation id is random and says nothing about the content.
 - The size of each piece, rounded up to whole MiB.
 - When each piece was added.
-- Which pieces belong to the same generation, which the timing shows anyway.
 
 **What they cannot see**
 

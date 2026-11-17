@@ -13,3 +13,5 @@ state.calibration.json
 daily.lock
 snapshots.json
 snapshots.calibration.json
+piece-kinds.json
+piece-kinds.calibration.json
