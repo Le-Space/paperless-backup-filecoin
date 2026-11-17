@@ -11,3 +11,5 @@ config.calibration.json
 state.json
 state.calibration.json
 daily.lock
+snapshots.json
+snapshots.calibration.json

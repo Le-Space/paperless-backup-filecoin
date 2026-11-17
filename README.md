@@ -169,6 +169,52 @@ Refusals of the service end the step with the code, the service's message and a 
 
 Tests: `npm test` runs the remote signer against a mocked service that checks each request as Le Space Credits does.
 
+## Incremental backups (snapshots)
+
+Off by default. With `"incremental": { "enabled": true }` in `config.json`, `run` uploads only what changed since the last backup. The design, costs and sources are in [docs/incremental-backups.md](docs/incremental-backups.md).
+
+**How a snapshot is made**
+
+- `document_exporter` keeps a persistent folder `export/state` up to date (`--compare-checksums --compare-json --delete --split-manifest --use-folder-prefix`, paperless-ngx 3.2.1). Only what changed is rewritten.
+- `run` scans that folder. Every file gets an id: HMAC-SHA256 with a dedup key over its SHA-256.
+- The files whose id the current *generation* does not hold yet go into one *pack*, together with the whole snapshot's index. The pack is padded to whole MiB and sealed with age to `ageRecipient`, as always.
+- The pack is one piece, a baseline above 1 GB in parts.
+- Each piece carries public metadata: `pa=snap/1`, `gen` (random) and `seq` (0 is the baseline). File ids and names stay inside the age stream.
+- **A new generation** (a full baseline) starts when:
+  - there is none;
+  - it is `rebaseDays` old (30);
+  - its deltas exceed `rebaseRatio` of the baseline (0.3);
+  - the dedup key changed;
+  - or with `run --rebase`.
+- `run --full` makes a full backup of the old kind.
+- The machine's index (which files the chain holds) is `snapshots.json` (`SNAPSHOT_STATE`).
+- A copy that missed a pack pulls it from another copy before the next pack is added there.
+
+**The dedup key**
+
+- `DEDUP_KEY_FILE` holds 64 hex, derived from the vault on paperless-anywhere.
+- Without that file, the key is derived from the age identity, as on a Mac.
+- A machine with a session key or the remote signer needs the file.
+
+**Restore**
+
+- `restore <pieceCid>` of a snapshot (from the ledger) fetches the packs of its generation up to it. Each part is checked against its piece CID (and size and SHA-256 where the ledger has them). It then writes the export folder and checks every file against its SHA-256. Run `document_importer` on that folder.
+- `restore-snapshot <entry.json> <folder> [--adopt]` does the same from an entry naming the packs and their URLs: `{ gen, seq, packs: [{ seq, parts: [{ pieceCid, size? }], urls: [[url per part], …] }] }`. With `--adopt` the machine's index continues that generation, so its next backup is a delta.
+
+**Retention**
+
+- `retain` reads each piece's metadata from the chain. Warm Storage stores it but its view has no getter, so it is read from storage slots with `extsload`; see [piece-metadata.mjs](piece-metadata.mjs).
+- It keeps every pack that a kept snapshot builds on, so in practice old generations go as a whole.
+- While snapshots are on chain and `incremental.restoreVerified` is not `true`, full backups of the old kind all stay (`legacy`).
+- `prune` leaves snapshots alone.
+
+| `incremental` key | Meaning |
+|---|---|
+| `enabled` | snapshots instead of full backups (default `false`) |
+| `restoreVerified` | set once a snapshot was restored and checked: old full backups then follow the normal policy |
+| `rebaseDays`, `rebaseRatio` | when a new generation starts (30, 0.3) |
+| `padBytes` | packs are padded to a multiple of this (1 MiB) |
+
 ## Limits — read before relying on it
 
 - **Locations are self-declared.** Each provider states its location in the on-chain registry; nobody verifies it.
