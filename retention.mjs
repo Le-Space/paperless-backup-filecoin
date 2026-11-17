@@ -379,3 +379,48 @@ export function retirePlan(sets, backups, { providerIds, copies = null, protect 
   }
   return { ready: true, why: null, retire, blocked }
 }
+
+/**
+ * Removing named pieces by hand (`remove`): a backup that should never have
+ * been written, e.g. one of an empty Paperless. Nothing is removed
+ *   - from a data set that is not a live one of this backup;
+ *   - unless every named piece is in every named data set (what is on chain
+ *     must be what the caller described);
+ *   - of a backup in parts unless all its parts are named;
+ *   - that is a snapshot pack (later packs build on it: `retain` removes those);
+ *   - that is protected (the backup a machine started from);
+ *   - unless a complete backup remains on chain after it.
+ * Pieces already scheduled for removal are not in `sets` and count as missing.
+ * @param {Array<{ dataSetId: string, providerId: string, pieces: Array<{ pieceId: any, pieceCid: string, date?: number | null, snapshot?: any }> }>} sets the account's live data sets
+ * @param {{ pieces: string[], dataSets: Array<number | string>, sizeOf: (cid: string) => number | null, copies?: number | null, protect?: Iterable<string> }} o
+ * @returns {{ ready: boolean, why: string | null, remove: Array<{ dataSetId: string, providerId: string, pieceId: bigint, pieceCid: string, size: number | null, date: number | null }>, keep: Array<{ dataSetId: string, providerId: string, pieceId: bigint, pieceCid: string, size: number | null, date: number | null }>, newestLeft: any }}
+ */
+export function removalPlan(sets, { pieces, dataSets, sizeOf, copies = null, protect = [] }) {
+  const no = (why) => ({ ready: false, why, remove: [], keep: [], newestLeft: null })
+  const want = new Set((pieces ?? []).map(String).filter(Boolean))
+  const named = [...new Set((dataSets ?? []).map(String).filter(Boolean))]
+  if (!want.size) return no('no pieces named (--pieces)')
+  if (!named.length) return no('no data sets named (--datasets)')
+  const guard = new Set([...protect].map(String))
+  for (const cid of want) if (guard.has(cid)) return no(`piece ${cid} is protected (the backup a machine started from)`)
+  const row = (ds, p) => ({ dataSetId: String(ds.dataSetId), providerId: String(ds.providerId), pieceId: BigInt(p.pieceId), pieceCid: String(p.pieceCid), size: sized(String(p.pieceCid), sizeOf), date: p.date ?? null })
+  const remove = []
+  const keep = []
+  for (const id of named) {
+    const ds = sets.find((s) => String(s.dataSetId) === id)
+    if (!ds) return no(`data set ${id} is not a live data set of this backup`)
+    for (const cid of want) if (!ds.pieces.some((p) => String(p.pieceCid) === cid)) return no(`piece ${cid} is not in data set ${id} (or already scheduled for removal)`)
+    for (const p of ds.pieces) if (p.snapshot && want.has(String(p.pieceCid))) return no(`piece ${p.pieceCid} is a snapshot pack; later packs build on it, so packs go through retain`)
+    for (const run of groupPieces(ds.pieces.filter((p) => !p.snapshot), sizeOf)) {
+      const hit = run.filter((p) => want.has(p.pieceCid))
+      if (hit.length && hit.length < run.length) return no(`piece ${hit[0].pieceCid} is one part of a backup in ${run.length} parts in data set ${id}; name all its parts`)
+    }
+    for (const p of ds.pieces) (want.has(String(p.pieceCid)) ? remove : keep).push(row(ds, p))
+  }
+  const left = sets.map((ds) => (named.includes(String(ds.dataSetId)) ? { ...ds, pieces: ds.pieces.filter((p) => !want.has(String(p.pieceCid))) } : ds))
+  const newestLeft = backupsOnChain(left, { sizeOf, copies }).find((b) => b.complete) ?? null
+  if (!newestLeft) return no('no complete backup would remain on chain')
+  const byId = (a, b) => (a.pieceId < b.pieceId ? -1 : a.pieceId > b.pieceId ? 1 : 0)
+  const order = (a, b) => named.indexOf(a.dataSetId) - named.indexOf(b.dataSetId) || byId(a, b)
+  return { ready: true, why: null, remove: remove.sort(order), keep: keep.sort(order), newestLeft }
+}

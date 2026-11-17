@@ -32,6 +32,9 @@
 //   node backup.mjs prune --yes     delete pieces older than keepWeeks (by the ledger)
 //   node backup.mjs retain [--yes]  keep the last N and one per day/week/month (config.retention),
 //                                   read from the chain; --yes schedules the removal of the rest
+//   node backup.mjs remove --pieces <cid>[,<cid>] --datasets <id>[,<id>] [--yes]
+//                                   remove named pieces (a backup that should not exist) from the
+//                                   named data sets; without --yes it only shows what goes and stays
 //   node backup.mjs retire [--providers 36,37] [--on-chain] [--yes]
 //                                   end (terminate) the data sets at providers the config no longer
 //                                   names, once the newest backup is at the named ones (wallet only)
@@ -63,7 +66,7 @@ import nodemailer from 'nodemailer'
 import { PART_BYTES, copyPieceIds, copyUrls, entryParts, isMultipart, missingParts, partHasher, partRanges, pieceFields, reassemble, uploadParts } from './parts.mjs'
 import { tryFrom as pieceFrom } from '@filoz/synapse-core/piece'
 import { dataSetLive, getActivePiecesByCursor, getScheduledRemovals } from '@filoz/synapse-core/pdp-verifier'
-import { backupsOnChain, consistentDates, describePlan, groupPieces, planRetention, removalsByDataSet, retentionPolicy, retirePlan } from './retention.mjs'
+import { backupsOnChain, consistentDates, describePlan, groupPieces, planRetention, removalPlan, removalsByDataSet, retentionPolicy, retirePlan } from './retention.mjs'
 import { backupMetadata, checkConfig, createRemoteSigner, dataSetState, ownDataSetsOf, parseBackupKey, payerAccount } from './remote-signer.mjs'
 import { Agent, setGlobalDispatcher } from 'undici'
 import { ByteReader, EXPORTER_ARGS, PREFIX_BYTES, classifyPrefix, dedupKeyFrom, emptyState, incrementalConfig, missingPieces, nextState, packPrefix, packStream, pieceMetadata, planSnapshot, readHeader, rebaseReason, restoreSnapshot, scanFiles, stateFromRestore } from './snapshot.mjs'
@@ -1315,6 +1318,44 @@ async function retain(yes) {
   return plan
 }
 
+// One backup that should never have been written (e.g. of a Paperless that
+// started empty): `remove` schedules the removal of the named pieces in the
+// named data sets, and of nothing else. Wallet only. Without --yes it prints
+// every piece of those data sets, what goes and what stays.
+async function remove(yes, { pieces, dataSets }) {
+  if (REMOTE) fail('with the remote signer, removals go through retain; remove is for the wallet')
+  if (process.env.SESSION_KEY_FILE) fail('a session key may not remove pieces; run remove with the wallet')
+  const owner = config.payer ?? process.env.PAYER_ADDRESS ?? privateKeyToAccount(walletKey()).address
+  const { sets } = await chainBackups(owner)
+  const protect = [...(config.retention?.protect ?? []), ...String(process.env.RETAIN_PROTECT ?? '').split(/[\s,]+/)].filter(Boolean)
+  const plan = removalPlan(sets, { pieces, dataSets, sizeOf: pieceBytes, copies: config.providerIds?.length || config.copies || null, protect })
+  if (!plan.ready) fail(`removing nothing: ${plan.why}`)
+  const when = (t) => (Number.isFinite(t) ? new Date(t).toISOString().slice(0, 16).replace('T', ' ') + ' UTC' : 'date unknown')
+  const line = (word, p) => `${word}  data set ${p.dataSetId} (provider ${p.providerId})  piece ${String(p.pieceId).padStart(3)}  ${when(p.date)}  ${String(p.size ?? '?').padStart(13)} bytes  ${p.pieceCid}`
+  for (const p of plan.keep) log(line('keep  ', p))
+  for (const p of plan.remove) log(line(yes ? 'remove' : 'would remove', p))
+  log(`newest complete backup that stays: ${when(plan.newestLeft.date)}, ${plan.newestLeft.size ?? '?'} bytes in ${plan.newestLeft.parts} part(s), first piece ${plan.newestLeft.pieceCid}`)
+  if (!yes) {
+    log('pass --yes to schedule these removals (irreversible once the provider proves the next period)')
+    return plan
+  }
+  const s = await synapse()
+  const byDataSet = new Map()
+  for (const p of plan.remove) byDataSet.set(p.dataSetId, [...(byDataSet.get(p.dataSetId) ?? []), p.pieceId])
+  for (const [dataSetId, ids] of byDataSet) {
+    const ctx = await s.storage.createContext({ dataSetId: BigInt(dataSetId) })
+    const tx = await ctx.deletePieces({ pieces: ids })
+    log(`scheduled the removal of ${ids.length} piece(s) in data set ${dataSetId}: ${tx}`)
+  }
+  // The ledger follows, as with retain.
+  const gone = new Set(plan.remove.map((p) => p.pieceCid))
+  const ledger = readLedger()
+  let changed = false
+  for (const e of ledger) if (!e.deleted && entryParts(e).every((p) => gone.has(p.pieceCid))) changed = e.deleted = true
+  if (changed) writeLedger(ledger)
+  return plan
+}
+
 // After the backups moved to other providers for good (config.providerIds),
 // the data sets at the old ones still cost: `retire` ends them (terminate:
 // the provider keeps them until the end epoch, then they are gone). Only
@@ -1696,6 +1737,15 @@ const commands = {
   },
   prune: () => prune(args.includes('--yes')),
   retain: () => retain(args.includes('--yes')),
+  remove: () => {
+    const list = (flag) => {
+      const at = args.indexOf(flag)
+      return at >= 0 ? String(args[at + 1] ?? '').split(',').filter((v) => v && !v.startsWith('--')) : []
+    }
+    const [pieces, dataSets] = [list('--pieces'), list('--datasets')]
+    if (!pieces.length || !dataSets.length) fail('usage: node backup.mjs remove --pieces <cid>[,<cid>] --datasets <id>[,<id>] [--yes]')
+    return remove(args.includes('--yes'), { pieces, dataSets })
+  },
   retire: () => {
     const at = args.indexOf('--providers')
     const only = at >= 0 ? String(args[at + 1] ?? '').split(',').filter(Boolean) : null

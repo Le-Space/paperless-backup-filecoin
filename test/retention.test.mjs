@@ -301,3 +301,77 @@ describe('snapshots: a generation stays together', () => {
     assert.equal(b[0].complete, true)
   })
 })
+
+describe('removing named pieces by hand', async () => {
+  const { removalPlan } = await import('../retention.mjs')
+  const SIZES = { full: PART_BYTES, tail: 5000, empty: 3633, old: 7000, other: 9000 }
+  const sizeOf = (cid) => SIZES[cid] ?? null
+  const p = (pieceId, pieceCid, extra = {}) => ({ pieceId: BigInt(pieceId), pieceCid, date: pieceId, ...extra })
+  // Three data sets: an old backup in the first, a backup in two parts and the empty one in all.
+  const sets = () => [
+    { dataSetId: '10', providerId: '1', pieces: [p(0, 'old'), p(1, 'full'), p(2, 'tail'), p(3, 'empty')] },
+    { dataSetId: '20', providerId: '43', pieces: [p(0, 'full'), p(1, 'tail'), p(2, 'empty')] },
+    { dataSetId: '30', providerId: '38', pieces: [p(0, 'full'), p(1, 'tail'), p(2, 'empty')] },
+  ]
+  const all = ['10', '20', '30']
+
+  it('removes exactly the named piece in each named data set and keeps the rest', () => {
+    const plan = removalPlan(sets(), { pieces: ['empty'], dataSets: all, sizeOf })
+    assert.equal(plan.ready, true)
+    assert.deepEqual(plan.remove.map((r) => [r.dataSetId, r.pieceId, r.pieceCid, r.size]), [['10', 3n, 'empty', 3633], ['20', 2n, 'empty', 3633], ['30', 2n, 'empty', 3633]])
+    assert.deepEqual(plan.keep.map((r) => `${r.dataSetId}/${r.pieceCid}`), ['10/old', '10/full', '10/tail', '20/full', '20/tail', '30/full', '30/tail'])
+    assert.equal(plan.newestLeft.pieceCid, 'full')
+    assert.equal(plan.newestLeft.parts, 2)
+    assert.equal(plan.newestLeft.size, PART_BYTES + 5000)
+  })
+
+  it('touches only the named data sets', () => {
+    const plan = removalPlan(sets(), { pieces: ['empty'], dataSets: ['20'], sizeOf })
+    assert.deepEqual(plan.remove.map((r) => r.dataSetId), ['20'])
+    assert.ok(plan.keep.every((r) => r.dataSetId === '20'))
+  })
+
+  it('refuses without pieces or data sets', () => {
+    assert.match(removalPlan(sets(), { pieces: [], dataSets: all, sizeOf }).why, /no pieces/)
+    assert.match(removalPlan(sets(), { pieces: ['empty'], dataSets: [], sizeOf }).why, /no data sets/)
+  })
+
+  it('refuses a data set that is not a live one of this backup', () => {
+    const plan = removalPlan(sets(), { pieces: ['empty'], dataSets: ['10', '99'], sizeOf })
+    assert.equal(plan.ready, false)
+    assert.match(plan.why, /data set 99/)
+    assert.deepEqual(plan.remove, [])
+  })
+
+  it('refuses when a named data set does not hold the piece', () => {
+    const plan = removalPlan(sets(), { pieces: ['old'], dataSets: all, sizeOf })
+    assert.match(plan.why, /not in data set 20/)
+    assert.deepEqual(plan.remove, [])
+  })
+
+  it('refuses one part of a backup in parts, takes all of them', () => {
+    assert.match(removalPlan(sets(), { pieces: ['tail'], dataSets: all, sizeOf }).why, /one part of a backup in 2 parts/)
+    assert.match(removalPlan(sets(), { pieces: ['full'], dataSets: all, sizeOf }).why, /one part/)
+    const s = sets()
+    for (const ds of s) ds.pieces.push(p(9, 'other'))
+    const plan = removalPlan(s, { pieces: ['full', 'tail'], dataSets: all, sizeOf })
+    assert.equal(plan.ready, true)
+    assert.equal(plan.remove.length, 6)
+  })
+
+  it('refuses when no complete backup would remain', () => {
+    const plan = removalPlan(sets(), { pieces: ['full', 'tail', 'empty'], dataSets: all, sizeOf })
+    assert.match(plan.why, /no complete backup would remain/)
+    assert.deepEqual(plan.remove, [])
+    // With copies = 3, a backup left in one data set only is not complete.
+    const s = sets().map((ds) => ({ ...ds, pieces: ds.pieces.filter((x) => x.pieceCid === 'empty' || x.pieceCid === 'old') }))
+    assert.match(removalPlan(s, { pieces: ['empty'], dataSets: all, sizeOf, copies: 3 }).why, /no complete backup/)
+  })
+
+  it('refuses a protected piece and a snapshot pack', () => {
+    assert.match(removalPlan(sets(), { pieces: ['empty'], dataSets: all, sizeOf, protect: ['empty'] }).why, /protected/)
+    const s = sets()
+    for (const ds of s) ds.pieces.push(p(9, 'pack', { snapshot: { gen: 'g', seq: 0, part: 0, parts: 1 } }))
+    assert.match(removalPlan(s, { pieces: ['pack'], dataSets: all, sizeOf }).why, /snapshot pack/)
+  })
+})
