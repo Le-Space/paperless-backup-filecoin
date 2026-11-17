@@ -247,3 +247,57 @@ describe('ending data sets after a move to other providers', async () => {
     assert.equal(retirePlan(sets, [b('n', 3, '3', '4')], { providerIds: [43, 38], only: [43] }).ready, false)
   })
 })
+
+describe('snapshots: a generation stays together', () => {
+  const G1 = '1111111111111111'
+  const G2 = '2222222222222222'
+  /** Pieces of one data set: made-up snapshot packs, oldest first. */
+  const packs = (specs, startId = 1) =>
+    specs.map(([gen, seq, daysAgo], i) => ({ pieceId: BigInt(startId + i), pieceCid: `snap-${gen.slice(0, 1)}-${seq}`, date: NOW - daysAgo * DAY, snapshot: { gen, seq, part: 0, parts: 1 } }))
+  const sizeOf = () => 5 * 2 ** 20
+
+  it('groups packs by generation and number, never by size, and counts a copy only with every pack before it', () => {
+    const full = packs([[G1, 0, 3], [G1, 1, 2], [G1, 2, 1]])
+    const gap = full.filter((p) => p.snapshot.seq !== 1)
+    const b = backupsOnChain([{ dataSetId: '1', pieces: full }, { dataSetId: '2', pieces: gap }], { sizeOf, copies: 2 })
+    const bySeq = Object.fromEntries(b.map((x) => [x.seq, x]))
+    assert.equal(b.length, 3)
+    assert.equal(bySeq[0].complete, true, 'pack 0: both data sets can restore it')
+    assert.equal(bySeq[2].complete, false, 'pack 2: one data set lacks pack 1')
+    assert.equal(bySeq[2].copies.length, 2, 'removal still reaches both data sets')
+  })
+
+  it('keeps every pack a kept snapshot builds on, and removes whole old generations', () => {
+    const ds = packs([[G1, 0, 60], [G1, 1, 59], [G1, 2, 58], [G2, 0, 20], [G2, 1, 2], [G2, 2, 1]])
+    const backups = backupsOnChain([{ dataSetId: '1', pieces: ds }], { sizeOf, copies: 1 })
+    const plan = planRetention(backups, { ...loose, keepLast: 1 }, { now: NOW })
+    const kept = plan.keep.map((b) => `${b.gen.slice(0, 1)}/${b.seq}`).sort()
+    assert.deepEqual(kept, ['2/0', '2/1', '2/2'])
+    assert.ok(plan.keep.find((b) => b.seq === 0).reasons.includes('generation'))
+    assert.deepEqual(plan.remove.map((b) => `${b.gen.slice(0, 1)}/${b.seq}`).sort(), ['1/0', '1/1', '1/2'])
+  })
+
+  it('keeps a whole older generation while a day/week/month pick lies in it', () => {
+    const ds = packs([[G1, 0, 10], [G1, 1, 9], [G2, 0, 1]])
+    const backups = backupsOnChain([{ dataSetId: '1', pieces: ds }], { sizeOf, copies: 1 })
+    const plan = planRetention(backups, { ...loose, keepDays: 14 }, { now: NOW })
+    assert.equal(plan.remove.length, 0)
+  })
+
+  it('keeps full backups of the old kind while keepLegacy is on, next to snapshots', () => {
+    const legacy = [{ pieceId: 1n, pieceCid: 'full-old', date: NOW - 90 * DAY }]
+    const ds = [...legacy, ...packs([[G1, 0, 2], [G1, 1, 1]], 2)]
+    const backups = backupsOnChain([{ dataSetId: '1', pieces: ds }], { sizeOf, copies: 1 })
+    assert.equal(planRetention(backups, { ...loose, keepLegacy: true }, { now: NOW }).remove.length, 0)
+    const without = planRetention(backups, { ...loose, keepLegacy: false }, { now: NOW })
+    assert.deepEqual(without.remove.map((b) => b.pieceCid), ['full-old'])
+  })
+
+  it('a pack in parts is one snapshot', () => {
+    const parts = [0, 1].map((part) => ({ pieceId: BigInt(part + 1), pieceCid: `base-${part}`, date: NOW, snapshot: { gen: G1, seq: 0, part, parts: 2 } }))
+    const b = backupsOnChain([{ dataSetId: '1', pieces: parts }], { sizeOf, copies: 1 })
+    assert.equal(b.length, 1)
+    assert.equal(b[0].key, 'base-0 base-1')
+    assert.equal(b[0].complete, true)
+  })
+})

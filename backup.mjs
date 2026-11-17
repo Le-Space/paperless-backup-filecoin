@@ -21,7 +21,11 @@
 //   node backup.mjs status          wallet, deposit, readiness
 //   node backup.mjs fund [months]   deposit USDFC and approve the storage service
 //   node backup.mjs plan            export + encrypt, show size and cost, no upload
-//   node backup.mjs run             export + encrypt + upload
+//   node backup.mjs run [--full] [--rebase]   export + encrypt + upload; with config.incremental
+//                                   on, a snapshot (snapshot.mjs): only what changed (--rebase: a new
+//                                   generation, --full: a full backup of the old kind)
+//   node backup.mjs restore-snapshot <entry.json> <folder> [--adopt] [--packs <dir>]   restore a snapshot from its
+//                                   generation's packs (--adopt: this machine continues that generation)
 //   node backup.mjs list            what the ledger holds
 //   node backup.mjs verify          is every copy still in its data set?
 //   node backup.mjs restore <pieceCid> [out.zip]   (the first part's, for a backup in parts)
@@ -40,7 +44,7 @@
 
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { createReadStream, createWriteStream, existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { Readable, Transform, Writable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { platform } from 'node:os'
@@ -62,6 +66,10 @@ import { dataSetLive, getActivePiecesByCursor, getScheduledRemovals } from '@fil
 import { backupsOnChain, consistentDates, describePlan, planRetention, removalsByDataSet, retentionPolicy, retirePlan } from './retention.mjs'
 import { backupMetadata, checkConfig, createRemoteSigner, dataSetState, ownDataSetsOf, parseBackupKey, payerAccount } from './remote-signer.mjs'
 import { Agent, setGlobalDispatcher } from 'undici'
+import { ByteReader, EXPORTER_ARGS, dedupKeyFrom, emptyState, incrementalConfig, keyCheck, missingPieces, nextState, packStream, parsePieceMetadata, pieceMetadata, planSnapshot, readHeader, rebaseReason, restoreSnapshot, scanFiles, stateFromRestore } from './snapshot.mjs'
+import { uploadPack } from './pack-upload.mjs'
+import { readPieceMetadata } from './piece-metadata.mjs'
+import { calculate as pieceCidOf } from '@filoz/synapse-core/piece'
 
 // A provider answers an upload only after it has hashed the whole piece, which
 // for a backup of several hundred MB takes longer than the 5 minutes Node's
@@ -129,6 +137,17 @@ if (REMOTE && process.env.SESSION_KEY_FILE) {
   console.error('error: remote-signer mode replaces SESSION_KEY_FILE; unset it')
   process.exit(1)
 }
+// Incremental backups (snapshot.mjs): off unless config.incremental.enabled.
+let INCREMENTAL
+try {
+  INCREMENTAL = incrementalConfig(config.incremental)
+} catch (err) {
+  console.error(`error: ${err.message}`)
+  process.exit(1)
+}
+// The machine's index of the current generation (which files the chain
+// holds); on the VM it lives on the sealed disk (SNAPSHOT_STATE).
+const SNAPSHOT_STATE = process.env.SNAPSHOT_STATE ?? join(HERE, config.network === 'calibration' ? 'snapshots.calibration.json' : 'snapshots.json')
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args)
@@ -588,7 +607,7 @@ async function plan() {
 // failed as primary: one provider that refuses the piece costs one copy, not
 // the backup. The result says how many copies the config asked for, so a
 // backup that lost one is marked incomplete and the next run tries all again.
-async function uploadWithRetry(s, chosen, backup) {
+async function uploadWithRetry(s, chosen, backup, upload = null) {
   let lastError
   let order = [...chosen]
   const refused = []
@@ -598,8 +617,9 @@ async function uploadWithRetry(s, chosen, backup) {
     try {
       // A fresh stream from the encrypted file for every attempt. One piece as
       // always; in parts, each part a piece, all parts on every copy.
-      const result =
-        backup.ranges.length > 1
+      const result = upload
+        ? await upload(contexts)
+        : backup.ranges.length > 1
           ? await uploadParts(contexts, backup.ranges, (range) => rangeStream(backup.sealedPath, range), { log })
           : await s.storage.upload(fileStream(backup.sealedPath), { contexts })
       if (!refused.length) return result
@@ -648,11 +668,281 @@ async function runBackup() {
   }
 }
 
+// --- incremental backups (snapshot.mjs) ---------------------------------------
+
+// The dedup key: DEDUP_KEY_FILE (the VM: a key from the vault), else, where
+// the age identity is at hand (the Mac), one derived from it. A machine that
+// signs with a session key or the remote signer has no identity: it needs the file.
+function dedupKey() {
+  const file = process.env.DEDUP_KEY_FILE
+  if (file) return dedupKeyFrom(readFileSync(file, 'utf8'))
+  if (REMOTE || process.env.SESSION_KEY_FILE) fail('incremental backups need DEDUP_KEY_FILE on this machine (a key from the vault)')
+  return dedupKeyFrom(ageIdentity())
+}
+
+function readSnapState() {
+  if (!existsSync(SNAPSHOT_STATE)) return emptyState()
+  const st = JSON.parse(readFileSync(SNAPSHOT_STATE, 'utf8'))
+  return st?.v === 1 ? st : emptyState()
+}
+
+function writeSnapState(state) {
+  const tmp = `${SNAPSHOT_STATE}.tmp`
+  writeFileSync(tmp, JSON.stringify(state) + '\n', { mode: 0o600 })
+  renameSync(tmp, SNAPSHOT_STATE)
+}
+
+// The persistent export folder, brought up to date by the exporter itself:
+// only what changed is rewritten, what Paperless no longer has is deleted.
+const PERSISTENT_DIR = 'state'
+function exportPersistent() {
+  const dir = join(EXPORT_DIR, PERSISTENT_DIR)
+  log('exporting Paperless into the persistent folder …')
+  const t0 = Date.now()
+  if (PAPERLESS_MANAGE) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    manage(['document_exporter', `../export/${PERSISTENT_DIR}`, ...EXPORTER_ARGS])
+  } else {
+    const inContainer = (args) => execFileSync('docker', ['compose', 'exec', '-T', '-u', 'paperless', PAPERLESS_SERVICE, ...args], { cwd: PAPERLESS, stdio: ['ignore', 'ignore', 'inherit'] })
+    inContainer(['mkdir', '-p', `../export/${PERSISTENT_DIR}`])
+    inContainer(['document_exporter', `../export/${PERSISTENT_DIR}`, ...EXPORTER_ARGS])
+  }
+  if (!existsSync(join(dir, 'manifest.json'))) fail(`the export did not write ${join(dir, 'manifest.json')}`)
+  log(`export: ${((Date.now() - t0) / 1000).toFixed(0)} s`)
+  return dir
+}
+
+// One pack, sealed with age to the vault's recipient into a file beside the
+// export, hashed on the way (whole and per part, as parts.mjs cuts it).
+async function sealPack(plan) {
+  if (!config.ageRecipient) fail('no ageRecipient in config.json; run: node backup.mjs init-key')
+  const name = `paperless-snap-${plan.gen}-${plan.seq}`
+  const sealedPath = join(EXPORT_DIR, `${name}.age`)
+  try {
+    const sealedHash = createHash('sha256')
+    const partHashes = partHasher(PART_BYTES)
+    const e = new Encrypter()
+    e.addRecipient(config.ageRecipient)
+    const sealedStream = await e.encrypt(Readable.toWeb(Readable.from(packStream(plan, { pad: INCREMENTAL.padBytes }))))
+    await pipeline(Readable.fromWeb(sealedStream), hashing(sealedHash), partHashes.stream, createWriteStream(sealedPath, { mode: 0o600 }))
+    const sealedBytes = statSync(sealedPath).size
+    const ranges = partRanges(sealedBytes, PART_BYTES)
+    const partSha256 = partHashes.digests()
+    if (partSha256.length !== ranges.length) fail(`hashed ${partSha256.length} parts of ${ranges.length}`)
+    return { name, sealedPath, sealedBytes, ranges, partSha256, sealedSha256: sealedHash.digest('hex') }
+  } catch (err) {
+    rmSync(sealedPath, { force: true })
+    throw err
+  }
+}
+
+const mib = (n) => `${(n / 2 ** 20).toFixed(1)} MiB`
+
+// The next snapshot, planned: export, scan, what is new. No upload, no state change.
+async function planNextSnapshot({ force = false } = {}) {
+  const key = dedupKey()
+  const dir = exportPersistent()
+  const state = readSnapState()
+  const now = Date.now()
+  const files = await scanFiles(dir, EXPORT_EXTRA_DIR ?? null, state.files ?? {})
+  if (!files.some((f) => f.path === 'manifest.json')) fail('the export folder has no manifest.json')
+  const rebase = rebaseReason(state, { key, now, rebaseDays: INCREMENTAL.rebaseDays, rebaseRatio: INCREMENTAL.rebaseRatio, force })
+  const plan = planSnapshot(files, state, { key, rebase, now })
+  log(`${plan.baseline ? `baseline of a new generation (${rebase})` : `delta ${plan.seq} of generation ${plan.gen}`}: ${plan.blobs.length} of ${files.length} files new, ${mib(plan.newBytes)} of ${mib(plan.totalBytes)}`)
+  return { key, state, plan }
+}
+
+async function runSnapshot({ force = false } = {}) {
+  const chosen = await resolveProviders()
+  const s = await synapse()
+  const { key, state, plan } = await planNextSnapshot({ force })
+  const sealed = await sealPack(plan)
+  try {
+    log(`pack ${plan.gen}/${plan.seq}: ${sealed.sealedBytes} bytes sealed${sealed.ranges.length > 1 ? ` in ${sealed.ranges.length} parts` : ''}`)
+    const { transaction } = await s.storage.prepare({ context: await chosenContexts(s), pieceSizes: sealed.ranges.map((r) => BigInt(r.size)) })
+    if (transaction && REMOTE) fail('the Le Space payer is not funded for this upload; tell Le Space (nothing was signed)')
+    if (transaction) fail(`account not funded for this upload (needs ${formatUnits(transaction.depositAmount)} USDFC); run: node backup.mjs fund`)
+    // A copy that lacks earlier packs of this generation pulls them first.
+    const lack = plan.baseline ? new Map() : missingPieces(state, chosen.map((p) => ({ providerId: p.id })))
+    const metaOf = (piece) => piece.pieceCids.map((_, j) => pieceMetadata({ gen: plan.gen, seq: piece.seq, part: j, parts: piece.pieceCids.length }))
+    const result = await uploadWithRetry(s, chosen, sealed, (contexts) =>
+      uploadPack(contexts, sealed.ranges, (range) => rangeStream(sealed.sealedPath, range), {
+        metadataFor: (part, parts) => pieceMetadata({ gen: plan.gen, seq: plan.seq, part, parts }),
+        missingFor: (providerId) => (lack.get(String(providerId)) ?? []).map((p) => ({ ...p, metadata: metaOf(p) })),
+        log,
+      }),
+    )
+    const date = new Date().toISOString()
+    const entry = jsonable({
+      kind: 'snapshot',
+      name: sealed.name,
+      date,
+      gen: plan.gen,
+      seq: plan.seq,
+      ...(plan.baseline ? { rebase: plan.rebase } : {}),
+      ...pieceFields(sealed, { ...result, pieceCids: result.pieceCids.length > 1 ? result.pieceCids : undefined }),
+      sealedSha256: sealed.sealedSha256,
+      files: plan.files.length,
+      newFiles: plan.blobs.length,
+      newBytes: plan.newBytes,
+      totalBytes: plan.totalBytes,
+      complete: result.complete,
+      requestedCopies: result.requestedCopies,
+      copies: result.copies.map((c) => ({ ...c, location: chosen.find((p) => p.id === Number(c.providerId))?.location })),
+      failedAttempts: result.failedAttempts,
+      deleted: false,
+    })
+    writeLedger([...readLedger(), entry])
+    writeSnapState(
+      nextState(state, plan, {
+        key,
+        piece: {
+          date,
+          pieceCids: result.pieceCids.map(String),
+          sizes: sealed.ranges.map((r) => r.size),
+          copies: result.copies.map((c) => jsonable({ providerId: c.providerId, dataSetId: c.dataSetId, retrievalUrls: c.retrievalUrls })),
+        },
+      }),
+    )
+    log(`snapshot ${plan.gen}/${plan.seq} (${entry.pieceCid}): ${result.copies.length}/${result.requestedCopies} copies${result.complete ? '' : ' (INCOMPLETE)'}`)
+    return entry
+  } finally {
+    rmSync(sealed.sealedPath, { force: true })
+  }
+}
+
+// One part of a pack fetched into `file`: synapse first, then each URL;
+// checked against its piece CID (and size and SHA-256 when known).
+async function fetchPart(s, part, urls, file) {
+  const tries = []
+  if (s) tries.push(async () => Buffer.from(await s.storage.download({ pieceCid: part.pieceCid })))
+  for (const url of urls ?? []) tries.push(async () => {
+    const res = await fetch(url)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    await pipeline(Readable.fromWeb(res.body), createWriteStream(file, { mode: 0o600 }))
+    return null
+  })
+  for (const attempt of tries) {
+    try {
+      const bytes = await attempt()
+      if (bytes) writeFileSync(file, bytes, { mode: 0o600 })
+      if (part.size != null && statSync(file).size !== part.size) throw new Error(`${statSync(file).size} bytes, expected ${part.size}`)
+      if (String(await pieceCidOf(createReadStream(file))) !== String(part.pieceCid)) throw new Error('does not match its piece CID')
+      if (part.sha256) {
+        const h = createHash('sha256')
+        for await (const c of createReadStream(file)) h.update(c)
+        if (h.digest('hex') !== part.sha256) throw new Error('does not match its SHA-256')
+      }
+      return
+    } catch (err) {
+      log(`piece ${part.pieceCid}: ${err.message}; next source`)
+    }
+  }
+  fail(`no copy delivered piece ${part.pieceCid}`)
+}
+
+/**
+ * Restores a snapshot into `outDir` (then: document_importer outDir).
+ * `entry`: { gen, seq, packs: [{ seq, parts: [{ pieceCid, size?, sha256? }], urls: [[url per part] per copy] }] }
+ * with every pack of the generation up to seq. With `adopt`, this machine's
+ * local index continues that generation (the VM restored from it).
+ */
+async function restoreSnapshotEntry(entry, outDir, { adopt = false, packsDir = null } = {}) {
+  if (!Number.isSafeInteger(entry?.seq) || !/^[0-9a-f]{16}$/.test(entry?.gen ?? '')) fail('the restore entry names no snapshot (gen, seq)')
+  const packs = [...(entry.packs ?? [])].sort((a, b) => a.seq - b.seq)
+  for (let i = 0; i <= entry.seq; i++) if (!packs.some((p) => p.seq === i)) fail(`pack ${i} of the generation is missing from the restore entry`)
+  let s = null
+  if (!packsDir) {
+    try {
+      s = await synapse()
+    } catch (err) {
+      log(`no synapse client (${err.message}); fetching from the providers' piece URLs`)
+    }
+  }
+  const work = `${outDir}.packs`
+  rmSync(work, { recursive: true, force: true })
+  mkdirSync(work, { recursive: true, mode: 0o700 })
+  const identity = ageIdentity()
+  try {
+    // Each pack fetched part by part and joined: one sealed file per pack.
+    const sealedOf = new Map()
+    // --packs: the caller fetched and checked each pack itself (<dir>/<seq>.age).
+    if (packsDir) for (const p of packs.filter((p) => p.seq <= entry.seq)) {
+      const file = join(packsDir, `${p.seq}.age`)
+      if (!existsSync(file)) fail(`pack ${p.seq} is not in ${packsDir}`)
+      sealedOf.set(p.seq, file)
+    }
+    for (const p of packsDir ? [] : packs.filter((p) => p.seq <= entry.seq)) {
+      const sealed = join(work, `${p.seq}.age`)
+      for (const [j, part] of p.parts.entries()) {
+        const file = join(work, `${p.seq}.${j}`)
+        await fetchPart(s, part, (p.urls ?? []).map((u) => u[j]).filter(Boolean), file)
+        await pipeline(createReadStream(file), createWriteStream(sealed, { flags: 'a', mode: 0o600 }))
+        rmSync(file)
+      }
+      sealedOf.set(p.seq, sealed)
+      log(`pack ${p.seq}/${entry.seq}: fetched and checked`)
+    }
+    const open = async (seq) => {
+      const d = new Decrypter()
+      d.addIdentity(identity)
+      return Readable.fromWeb(await d.decrypt(fileStream(sealedOf.get(seq))))
+    }
+    const head = new ByteReader(await open(entry.seq))
+    const target = await readHeader(head)
+    await head.cancel()
+    if (target.gen !== entry.gen || target.seq !== entry.seq) fail('the snapshot pack names another generation or number')
+    const r = await restoreSnapshot(target, open, outDir)
+    log(`restored snapshot ${entry.gen}/${entry.seq}: ${r.files} files, ${mib(r.bytes)} into ${outDir}`)
+    if (adopt) {
+      const base = packs.find((p) => p.seq === 0)
+      writeSnapState(
+        stateFromRestore(target, {
+          key: dedupKey(),
+          pieces: packs.map((p) => ({ seq: p.seq, pieceCids: p.parts.map((x) => x.pieceCid), sizes: p.parts.map((x) => x.size), date: p.date ?? null, copies: (p.copies ?? []).map((c) => ({ providerId: c.providerId, dataSetId: c.dataSetId, retrievalUrls: c.retrievalUrls })) })),
+          blobs: r.blobs,
+          written: r.written,
+          baseBytes: target.files.reduce((n, f) => n + f[2], 0),
+          started: base?.date ?? new Date().toISOString(),
+        }),
+      )
+      log(`this machine continues generation ${entry.gen} from here (${SNAPSHOT_STATE})`)
+    }
+    return r
+  } finally {
+    rmSync(work, { recursive: true, force: true })
+  }
+}
+
+// A snapshot's restore entry from the ledger: its generation's packs up to it.
+function snapshotEntryFromLedger(entry) {
+  const gen = readLedger().filter((e) => e.kind === 'snapshot' && e.gen === entry.gen && e.seq <= entry.seq)
+  return {
+    gen: entry.gen,
+    seq: entry.seq,
+    packs: gen.map((e) => ({
+      seq: e.seq,
+      date: e.date,
+      parts: entryParts(e).map((p) => ({ pieceCid: p.pieceCid, size: p.size, sha256: p.sha256 })),
+      urls: e.copies.map((c) => copyUrls(c)),
+      copies: e.copies.map((c) => ({ providerId: c.providerId, dataSetId: c.dataSetId, retrievalUrls: copyUrls(c) })),
+    })),
+  }
+}
+
+// `run`: a snapshot when incremental backups are on (--rebase: a new
+// generation), else, or with --full, a full backup as always.
+function backupNow() {
+  if (INCREMENTAL.enabled && !args.includes('--full')) return runSnapshot({ force: args.includes('--rebase') })
+  return runBackup()
+}
+
 async function list() {
   for (const e of readLedger()) {
     const where = e.copies.map((c) => `${c.providerId}@${(c.location ?? '').replace(/;.*$/, '')}`).join(' ')
     const size = `${(e.size / 2 ** 20).toFixed(0)} MiB${isMultipart(e) ? ` in ${e.parts.length} parts` : ''}`
-    console.log([e.date.slice(0, 10), e.deleted ? 'deleted' : e.complete ? 'complete' : 'partial', e.pieceCid, size, where].join(' | '))
+    const kind = e.kind === 'snapshot' ? [`snapshot ${e.gen}/${e.seq}${e.seq === 0 ? ' (baseline)' : ''}`] : []
+    console.log([e.date.slice(0, 10), ...kind, e.deleted ? 'deleted' : e.complete ? 'complete' : 'partial', e.pieceCid, size, where].join(' | '))
   }
   // Remote-signer mode: what the chain holds for this backup, also without a
   // ledger (a new VM restoring).
@@ -703,6 +993,12 @@ async function verify() {
 async function restore(pieceCid, out) {
   if (!pieceCid) fail('usage: node backup.mjs restore <pieceCid> [out.zip]')
   const entry = readLedger().find((e) => e.pieceCid === pieceCid || entryParts(e).some((p) => p.pieceCid === pieceCid))
+  if (entry?.kind === 'snapshot') {
+    const dir = out ?? join(HERE, `restore-${entry.gen}-${entry.seq}`)
+    await restoreSnapshotEntry(snapshotEntryFromLedger(entry), dir)
+    log(`import into an empty Paperless with: document_importer ${dir}`)
+    return
+  }
   if (entry && isMultipart(entry)) return restoreParts(entry, out)
   let sealed
   try {
@@ -785,7 +1081,8 @@ async function prune(yes) {
   if (process.env.SESSION_KEY_FILE && !REMOTE) fail('pruning removes pieces, which a session key may not; run it with the wallet')
   const cutoff = Date.now() - config.keepWeeks * 7 * DAY
   const ledger = readLedger()
-  const old = ledger.filter((e) => !e.deleted && Date.parse(e.date) < cutoff)
+  // Snapshots build on each other: they go only through `retain`, a generation at a time.
+  const old = ledger.filter((e) => !e.deleted && e.kind !== 'snapshot' && Date.parse(e.date) < cutoff)
   if (!old.length) {
     log('nothing older than', config.keepWeeks, 'weeks')
     return []
@@ -862,7 +1159,7 @@ const pieceBytes = (cid) => pieceFrom(cid)?.size ?? null
  * tag), their active pieces without those already scheduled for removal.
  */
 async function chainBackups(owner) {
-  const client = createPublicClient({ chain, transport: http() })
+  const client = createPublicClient({ chain, transport: http(), batch: { multicall: true } })
   const all = []
   let cursor
   for (let page = 0; page < 100; page++) {
@@ -890,6 +1187,10 @@ async function chainBackups(owner) {
       if (nextCursor == null) break
       start = nextCursor
     }
+    // Snapshot packs say so in their piece metadata (pa, gen, seq). A read
+    // that fails fails `retain`: it removes nothing it cannot place.
+    const meta = await readPieceMetadata(client, chain.contracts.fwss.address, dataSetId, pieces.map((p) => p.pieceId), ['pa', 'gen', 'seq'])
+    for (const p of pieces) p.snapshot = parsePieceMetadata(meta.get(String(p.pieceId)))
     read.push({ dataSetId: id, providerId: String(ds.providerId), pieces: consistentDates(pieces) })
   }
   return { sets: read, scheduled }
@@ -910,6 +1211,9 @@ async function retain(yes) {
   const { sets, scheduled } = await chainBackups(owner)
   // Complete with the copies the config asks for (providerIds, else copies).
   const backups = backupsOnChain(sets, { sizeOf: pieceBytes, copies: config.providerIds?.length || config.copies || null })
+  // Once snapshots are on chain, the full backups of the old kind stay until
+  // a snapshot has been restored and checked (incremental.restoreVerified).
+  if (backups.some((b) => b.gen != null) && !INCREMENTAL.restoreVerified) policy.keepLegacy = true
   const plan = planRetention(backups, policy, { now: Date.now(), protect })
   for (const line of describePlan(plan)) log(line)
   if (plan.overBudget) log('WARNING: what must stay does not leave room for another backup within retention.maxBytes')
@@ -1274,7 +1578,7 @@ async function daily() {
       log(`no change in Paperless since ${lastUpload.date}; nothing uploaded`)
       report = { kind: 'unchanged', lastUpload }
     } else {
-      const entry = await runBackup()
+      const entry = await backupNow()
       const missing = await verify()
       const pruned = config.daily?.prune ? (await prune(true)).length : 0
       report = { kind: entry.complete && !missing ? 'done' : 'incomplete', entry, missing, pruned }
@@ -1309,9 +1613,9 @@ const commands = {
   providers,
   status,
   fund: () => fund(Number(args[0] ?? 3)),
-  plan,
+  plan: () => (INCREMENTAL.enabled && !args.includes('--full') ? planNextSnapshot({ force: args.includes('--rebase') }) : plan()),
   run: async () => {
-    if (!(await runBackup()).complete) process.exitCode = 2
+    if (!(await backupNow()).complete) process.exitCode = 2
   },
   list,
   verify: async () => {
@@ -1323,6 +1627,13 @@ const commands = {
   'mail-test': () => mailTest(args.includes('--warning')),
   'mail-preview': mailPreview,
   restore: () => restore(args[0], args[1]),
+  'restore-snapshot': async () => {
+    const at = args.indexOf('--packs')
+    const packsDir = at >= 0 ? args[at + 1] : null
+    const [file, out] = args.filter((a, i) => !a.startsWith('--') && (at < 0 || i !== at + 1))
+    if (!file || !out || (at >= 0 && !packsDir)) fail('usage: node backup.mjs restore-snapshot <entry.json> <empty folder> [--adopt] [--packs <dir with <seq>.age>]')
+    await restoreSnapshotEntry(JSON.parse(readFileSync(file, 'utf8')), out, { adopt: args.includes('--adopt'), packsDir })
+  },
   prune: () => prune(args.includes('--yes')),
   retain: () => retain(args.includes('--yes')),
   retire: () => {

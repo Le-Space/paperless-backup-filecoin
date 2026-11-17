@@ -25,12 +25,12 @@ const DAY = 24 * 60 * 60 * 1000
 
 /** What `retain` keeps when the config says nothing, per network. */
 export const DEFAULT_RETENTION = Object.freeze({
-  mainnet: Object.freeze({ keepLast: 3, keepDays: 7, keepWeeks: 4, keepMonths: 6, maxBytes: null }),
-  calibration: Object.freeze({ keepLast: 2, keepDays: 2, keepWeeks: 1, keepMonths: 0, maxBytes: null }),
+  mainnet: Object.freeze({ keepLast: 3, keepDays: 7, keepWeeks: 4, keepMonths: 6, maxBytes: null, keepLegacy: false }),
+  calibration: Object.freeze({ keepLast: 2, keepDays: 2, keepWeeks: 1, keepMonths: 0, maxBytes: null, keepLegacy: false }),
 })
 
 /** Why a backup stays, in the order they are reported. */
-export const REASONS = Object.freeze(['newest', 'restored', 'place', 'last', 'undated', 'day', 'week', 'month'])
+export const REASONS = Object.freeze(['newest', 'restored', 'place', 'last', 'undated', 'day', 'week', 'month', 'generation', 'legacy'])
 
 /**
  * The policy from config.retention over the network's defaults, checked.
@@ -45,7 +45,8 @@ export function retentionPolicy(retention, network) {
   }
   if (p.keepLast < 1) throw new RangeError('retention.keepLast must be at least 1')
   if (p.maxBytes != null && !(Number.isSafeInteger(p.maxBytes) && p.maxBytes > 0)) throw new RangeError('retention.maxBytes must be a positive number of bytes')
-  return { keepLast: p.keepLast, keepDays: p.keepDays, keepWeeks: p.keepWeeks, keepMonths: p.keepMonths, maxBytes: p.maxBytes ?? null }
+  if (p.keepLegacy != null && typeof p.keepLegacy !== 'boolean') throw new RangeError('retention.keepLegacy must be true or false')
+  return { keepLast: p.keepLast, keepDays: p.keepDays, keepWeeks: p.keepWeeks, keepMonths: p.keepMonths, maxBytes: p.maxBytes ?? null, keepLegacy: p.keepLegacy ?? false }
 }
 
 /** The payload size a piece CID (v2) carries, or null. @param {string} cid @param {(cid: string) => number | null} sizeOf */
@@ -99,8 +100,36 @@ export function groupPieces(pieces, sizeOf) {
 export function backupsOnChain(sets, { sizeOf, copies = null }) {
   const wanted = Math.min(copies > 0 ? copies : sets.length, sets.length)
   const byKey = new Map()
+  // Snapshot packs (pieces with `snapshot` = { gen, seq, part, parts }):
+  // grouped by generation and number, never by size.
+  const snaps = new Map()
+  const held = new Map()
   for (const ds of sets) {
-    for (const run of groupPieces(ds.pieces, sizeOf)) {
+    const id = String(ds.dataSetId)
+    const here = new Map()
+    for (const p of ds.pieces) {
+      if (!p.snapshot) continue
+      const k = `${p.snapshot.gen}/${p.snapshot.seq}`
+      here.set(k, [...(here.get(k) ?? []), p])
+    }
+    const full = new Set()
+    for (const [k, ps] of here) {
+      const { gen, seq, parts } = ps[0].snapshot
+      const s = snaps.get(k) ?? { gen, seq, parts, cids: [], order: 0, dates: [], copies: [] }
+      const sorted = [...ps].sort((a, b) => (BigInt(a.pieceId) < BigInt(b.pieceId) ? -1 : 1))
+      for (const p of sorted) {
+        s.cids[p.snapshot.part] ??= String(p.pieceCid)
+        if (Number.isFinite(p.date)) s.dates.push(p.date)
+        s.order = Math.max(s.order, Number(p.pieceId))
+      }
+      s.copies.push({ dataSetId: id, pieceIds: sorted.map((p) => BigInt(p.pieceId)) })
+      if (new Set(ps.map((p) => p.snapshot.part)).size === parts) full.add(k)
+      snaps.set(k, s)
+    }
+    held.set(id, full)
+  }
+  for (const ds of sets) {
+    for (const run of groupPieces(ds.pieces.filter((p) => !p.snapshot), sizeOf)) {
       const key = run.map((p) => p.pieceCid).join(' ')
       const b = byKey.get(key) ?? { key, run, order: 0, dates: [], copies: [] }
       b.order = Math.max(b.order, Number(run.at(-1).pieceId))
@@ -121,8 +150,25 @@ export function backupsOnChain(sets, { sizeOf, copies = null }) {
     }
     out.push(b)
   }
-  return out
-    .map((b) => {
+  // A data set can restore a snapshot only with every pack of its generation up to it.
+  const restorable = (s) => [...held.values()].filter((full) => Array.from({ length: s.seq + 1 }, (_, i) => `${s.gen}/${i}`).every((k) => full.has(k))).length
+  const snapshots = [...snaps.values()].map((s) => {
+    const sizes = s.cids.map((c) => (c ? sized(c, sizeOf) : null))
+    return {
+      key: s.cids.filter(Boolean).join(' '),
+      pieceCid: s.cids[0] ?? s.cids.find(Boolean),
+      parts: s.parts,
+      size: sizes.length === s.parts && sizes.every((n) => n != null) ? sizes.reduce((a, n) => a + n, 0) : null,
+      date: s.dates.length ? Math.min(...s.dates) : null,
+      order: s.order,
+      complete: restorable(s) >= wanted,
+      copies: s.copies,
+      gen: s.gen,
+      seq: s.seq,
+    }
+  })
+  return [
+    ...out.map((b) => {
       const sizes = b.run.map((p) => p.size)
       return {
         key: b.key,
@@ -134,7 +180,9 @@ export function backupsOnChain(sets, { sizeOf, copies = null }) {
         complete: b.copies.length >= wanted,
         copies: [...b.copies, ...(b.fragments ?? [])],
       }
-    })
+    }),
+    ...snapshots,
+  ]
     .sort((a, b) => (a.date ?? -Infinity) - (b.date ?? -Infinity) || a.order - b.order)
     .map((b, i) => ({ ...b, order: i + 1 }))
     .reverse()
@@ -216,6 +264,15 @@ export function planRetention(backups, policy, { now, protect = [] }) {
     }
     overBudget = keptBytes() + room > policy.maxBytes
   }
+
+  // Backups of the old kind (full, no snapshot metadata) stay while the
+  // snapshots have not been restored once (keepLegacy).
+  if (policy.keepLegacy) for (const b of sorted) if (b.gen == null) add(b, 'legacy')
+  // A snapshot needs every pack before it in its generation: whatever a kept
+  // snapshot builds on stays too. Packs after the newest kept one may go.
+  const upTo = new Map()
+  for (const b of sorted) if (b.gen != null && why.get(b).size) upTo.set(b.gen, Math.max(upTo.get(b.gen) ?? -1, b.seq))
+  for (const b of sorted) if (b.gen != null && !why.get(b).size && b.seq <= (upTo.get(b.gen) ?? -1)) add(b, 'generation')
 
   const order = (r) => REASONS.indexOf(r)
   const keep = []
