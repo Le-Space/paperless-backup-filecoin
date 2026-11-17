@@ -181,6 +181,7 @@ Off by default. With `"incremental": { "enabled": true }` in `config.json`, `run
 - The pack is one piece, a baseline above 1 GB in parts.
 - The sealed pack starts with a public 64-byte prefix, `PA-SNAP/1 <gen> <seq>`: `gen` is random, `seq` 0 is the baseline. The age stream follows it. File ids and names stay inside the age stream.
 - The pieces also carry `pa`/`gen`/`seq` as piece metadata, but Warm Storage keeps that only in its `PieceAdded` event, not in its state. The prefix is what can be read back at any time.
+- **The prefix is public:** anyone who fetches a piece's first bytes learns that it is an incremental backup, its generation and its number. Nothing about the documents. See [docs/incremental-backups.md](docs/incremental-backups.md).
 - **A new generation** (a full baseline) starts when:
   - there is none;
   - it is `rebaseDays` old (30);
