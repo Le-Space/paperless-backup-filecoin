@@ -24,12 +24,14 @@
 // state). Dedup holds within a generation only: each pack has fresh age file
 // keys, nothing links two generations.
 //
-// On chain, each piece carries public metadata (3 keys at most per piece):
-//   pa  = "snap/1" (or "snap/1 2/3": part 2 of 3 of a pack in parts)
-//   gen = the generation (16 random hex)
-//   seq = the pack's number within its generation, 0 = the baseline
-// which is what `retain` and the app need to keep a generation together
-// without any key.
+// The sealed pack starts with a public prefix of PREFIX_BYTES before the age
+// stream: "PA-SNAP/1 <gen> <seq>", padded with spaces, ending in a newline.
+// `retain` and the app read it with an HTTP range request (bytes 0-63) to
+// keep a generation together without any key; a full backup of the old kind
+// starts with age's own header instead. (Warm Storage no longer keeps piece
+// metadata in its state, only in the PieceAdded event: the prefix is what
+// can be read back at any time. The pieces also carry pa/gen/seq as piece
+// metadata, for indexers of those events.)
 //
 // Plain logic over files and streams: tested without a chain.
 
@@ -40,6 +42,10 @@ import { dirname, join, posix, sep } from 'node:path'
 import { deflateRawSync, inflateRawSync } from 'node:zlib'
 
 export const FORMAT = 'snap/1'
+/** The public prefix of a sealed pack. */
+export const PREFIX_BYTES = 64
+const PREFIX_TAG = 'PA-SNAP/1'
+const AGE_TAG = 'age-encryption.org/v1'
 export const MAGIC = Buffer.from('PASNAP01')
 /** Packs are padded to a multiple of this many bytes of plaintext. */
 export const PAD_BYTES = 1 << 20
@@ -113,6 +119,26 @@ export function parsePieceMetadata(meta) {
   const part = m[1] ? Number(m[1]) - 1 : 0
   if (parts < 1 || part < 0 || part >= parts) return null
   return { gen, seq, part, parts }
+}
+
+/** A sealed pack's public prefix. */
+export function packPrefix({ gen, seq }) {
+  if (!/^[0-9a-f]{16}$/.test(gen) || !Number.isSafeInteger(seq) || seq < 0) throw new Error('no generation or number for the prefix')
+  const line = `${PREFIX_TAG} ${gen} ${seq}`
+  return Buffer.from(line.padEnd(PREFIX_BYTES - 1, ' ') + '\n')
+}
+
+/**
+ * What the first bytes of a piece say: a snapshot pack ({ gen, seq }), a
+ * full backup of the old kind ('full'), or null (something else, or too few bytes).
+ * @param {Uint8Array} bytes at least the first PREFIX_BYTES (or 21 for age's header)
+ */
+export function classifyPrefix(bytes) {
+  const b = Buffer.from(bytes)
+  if (b.subarray(0, AGE_TAG.length).toString('latin1') === AGE_TAG) return 'full'
+  if (b.length < PREFIX_BYTES || b[PREFIX_BYTES - 1] !== 0x0a) return null
+  const m = /^PA-SNAP\/1 ([0-9a-f]{16}) (0|[1-9][0-9]{0,9}) *$/.exec(b.subarray(0, PREFIX_BYTES - 1).toString('latin1'))
+  return m ? { gen: m[1], seq: Number(m[2]) } : null
 }
 
 // --- the export folder ----------------------------------------------------------
