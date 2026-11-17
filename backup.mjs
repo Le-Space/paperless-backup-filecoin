@@ -24,7 +24,7 @@
 //   node backup.mjs run [--full] [--rebase]   export + encrypt + upload; with config.incremental
 //                                   on, a snapshot (snapshot.mjs): only what changed (--rebase: a new
 //                                   generation, --full: a full backup of the old kind)
-//   node backup.mjs restore-snapshot <entry.json> <folder> [--adopt]   restore a snapshot from its
+//   node backup.mjs restore-snapshot <entry.json> <folder> [--adopt] [--packs <dir>]   restore a snapshot from its
 //                                   generation's packs (--adopt: this machine continues that generation)
 //   node backup.mjs list            what the ledger holds
 //   node backup.mjs verify          is every copy still in its data set?
@@ -847,15 +847,17 @@ async function fetchPart(s, part, urls, file) {
  * with every pack of the generation up to seq. With `adopt`, this machine's
  * local index continues that generation (the VM restored from it).
  */
-async function restoreSnapshotEntry(entry, outDir, { adopt = false } = {}) {
+async function restoreSnapshotEntry(entry, outDir, { adopt = false, packsDir = null } = {}) {
   if (!Number.isSafeInteger(entry?.seq) || !/^[0-9a-f]{16}$/.test(entry?.gen ?? '')) fail('the restore entry names no snapshot (gen, seq)')
   const packs = [...(entry.packs ?? [])].sort((a, b) => a.seq - b.seq)
   for (let i = 0; i <= entry.seq; i++) if (!packs.some((p) => p.seq === i)) fail(`pack ${i} of the generation is missing from the restore entry`)
   let s = null
-  try {
-    s = await synapse()
-  } catch (err) {
-    log(`no synapse client (${err.message}); fetching from the providers' piece URLs`)
+  if (!packsDir) {
+    try {
+      s = await synapse()
+    } catch (err) {
+      log(`no synapse client (${err.message}); fetching from the providers' piece URLs`)
+    }
   }
   const work = `${outDir}.packs`
   rmSync(work, { recursive: true, force: true })
@@ -864,7 +866,13 @@ async function restoreSnapshotEntry(entry, outDir, { adopt = false } = {}) {
   try {
     // Each pack fetched part by part and joined: one sealed file per pack.
     const sealedOf = new Map()
-    for (const p of packs.filter((p) => p.seq <= entry.seq)) {
+    // --packs: the caller fetched and checked each pack itself (<dir>/<seq>.age).
+    if (packsDir) for (const p of packs.filter((p) => p.seq <= entry.seq)) {
+      const file = join(packsDir, `${p.seq}.age`)
+      if (!existsSync(file)) fail(`pack ${p.seq} is not in ${packsDir}`)
+      sealedOf.set(p.seq, file)
+    }
+    for (const p of packsDir ? [] : packs.filter((p) => p.seq <= entry.seq)) {
       const sealed = join(work, `${p.seq}.age`)
       for (const [j, part] of p.parts.entries()) {
         const file = join(work, `${p.seq}.${j}`)
@@ -1620,9 +1628,11 @@ const commands = {
   'mail-preview': mailPreview,
   restore: () => restore(args[0], args[1]),
   'restore-snapshot': async () => {
-    const [file, out] = args.filter((a) => !a.startsWith('--'))
-    if (!file || !out) fail('usage: node backup.mjs restore-snapshot <entry.json> <empty folder> [--adopt]')
-    await restoreSnapshotEntry(JSON.parse(readFileSync(file, 'utf8')), out, { adopt: args.includes('--adopt') })
+    const at = args.indexOf('--packs')
+    const packsDir = at >= 0 ? args[at + 1] : null
+    const [file, out] = args.filter((a, i) => !a.startsWith('--') && (at < 0 || i !== at + 1))
+    if (!file || !out || (at >= 0 && !packsDir)) fail('usage: node backup.mjs restore-snapshot <entry.json> <empty folder> [--adopt] [--packs <dir with <seq>.age>]')
+    await restoreSnapshotEntry(JSON.parse(readFileSync(file, 'utf8')), out, { adopt: args.includes('--adopt'), packsDir })
   },
   prune: () => prune(args.includes('--yes')),
   retain: () => retain(args.includes('--yes')),
