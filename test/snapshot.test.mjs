@@ -13,7 +13,9 @@ import { Decrypter, Encrypter, generateX25519Identity, identityToRecipient } fro
 import {
   ByteReader,
   EXTRA_PREFIX,
+  PREFIX_BYTES,
   blobId,
+  classifyPrefix,
   decodeHeader,
   dedupKeyFrom,
   emptyState,
@@ -22,6 +24,7 @@ import {
   keyCheck,
   missingPieces,
   nextState,
+  packPrefix,
   packStream,
   parsePieceMetadata,
   pieceMetadata,
@@ -128,6 +131,24 @@ describe('piece metadata', () => {
     for (const m of [undefined, {}, { ipfsRootCID: 'x' }, { pa: 'snap/1', gen: 'xyz', seq: '1' }, { pa: 'snap/1', gen: '0123456789abcdef', seq: '01' }, { pa: 'snap/1 3/2', gen: '0123456789abcdef', seq: '1' }]) {
       assert.equal(parsePieceMetadata(m), null, JSON.stringify(m))
     }
+  })
+})
+
+describe('the public prefix', () => {
+  it('names generation and number in 64 bytes, and reads back', () => {
+    const p = packPrefix({ gen: '0123456789abcdef', seq: 7 })
+    assert.equal(p.length, PREFIX_BYTES)
+    assert.match(p.toString(), /^PA-SNAP\/1 0123456789abcdef 7 +\n$/)
+    assert.deepEqual(classifyPrefix(p), { gen: '0123456789abcdef', seq: 7 })
+  })
+  it('tells a full backup (age header) from a pack, and refuses anything else', () => {
+    assert.equal(classifyPrefix(Buffer.from('age-encryption.org/v1\n-> X25519 made-up')), 'full')
+    assert.equal(classifyPrefix(Buffer.alloc(64)), null)
+    assert.equal(classifyPrefix(packPrefix({ gen: '0123456789abcdef', seq: 1 }).subarray(0, 40)), null)
+    const odd = Buffer.from(packPrefix({ gen: '0123456789abcdef', seq: 1 }))
+    odd.write('01', 26)
+    assert.equal(classifyPrefix(odd), null, 'a number with a leading zero')
+    assert.throws(() => packPrefix({ gen: 'xyz', seq: 1 }), /generation/)
   })
 })
 
