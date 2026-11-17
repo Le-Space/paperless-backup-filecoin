@@ -96,6 +96,7 @@ Step-by-step setup: [HOWTO.txt](HOWTO.txt). Auf Deutsch: [ANLEITUNG.txt](ANLEITU
 | `node backup.mjs restore <pieceCid> [out.zip]` | download, check, decrypt (a backup in parts: by its first part's piece CID) |
 | `node backup.mjs prune --yes` | delete backups older than `keepWeeks` (the newest complete one always stays) |
 | `node backup.mjs retain [--yes]` | keep the last N and one per day, week and month (`retention`), read from the chain; `--yes` schedules the removal of the rest (see [Retention](#retention)) |
+| `node backup.mjs remove --pieces <cid>[,<cid>] --datasets <id>[,<id>] [--yes]` | remove named pieces from the named data sets: a backup that should not exist, e.g. of a Paperless that started empty (wallet only; see [Retention](#retention)) |
 | `node backup.mjs retire [--providers 36,37] [--on-chain] [--yes]` | end the data sets at providers `providerIds` no longer names, once the newest backup is on chain at the named ones (wallet only; see [Retention](#retention)) |
 | `node backup.mjs mail-from-paperless` / `mail-check` / `mail-test` / `mail-preview` | take the SMTP login from a Paperless mail account; check the login; send a test report; print the report (and a low-funds and a failure example) without sending |
 | `node backup.mjs daily` | once a day: back up if Paperless changed, verify, prune, mail a report; catches up if the machine was off |
@@ -259,6 +260,8 @@ The chain keeps no date per piece. `retain` takes them from the PDP explorer's s
 Without `--yes` it only prints the plan (date, size, why). With `--yes` it schedules the removals, one `SchedulePieceRemovals` per data set with every part of every copy, and marks those ledger entries deleted. Removal needs the wallet or the remote signer; with a session key `retain --yes` only plans. A provider carries a removal out at its next proving step, so the data set shrinks with a delay (on mainnet up to a day). `RETAIN_REPORT=<file>` writes the plan as JSON.
 
 ### Moving to other providers
+
+`remove` is for one backup that should never have been written, such as the backup of a Paperless that started empty: `retain` would count it as the newest one and keep it. `remove --pieces <cid> --datasets <id>,<id>` lists every piece of the named data sets with its id, date and size, what would go and what stays, and the newest complete backup that remains. With `--yes` it schedules exactly those removals, one `SchedulePieceRemovals` per data set, signed by the wallet. It removes nothing unless every named piece is in every named data set, and never one part of a backup in parts, a snapshot pack (later packs build on it), a protected piece, or the last complete backup. The provider sends the transaction, so the wallet pays no gas, and carries the removal out at its next proving step.
 
 After `providerIds` changed for good, the data sets at the old providers keep costing. `retire` ends them (terminate: the provider keeps a data set until its end epoch, then drops it). It ends nothing while the config names no providers or the newest backup is not yet on chain at `copies` of the named providers, and it keeps a data set that alone holds a protected backup or an undated one. Without `--yes` it prints what it would end. Only the wallet can end data sets: not a session key, and not the remote signer, where Le Space ends its own.
 
