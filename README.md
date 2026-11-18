@@ -253,6 +253,8 @@ Nothing removes old pieces on its own, so data sets only grow. `retain` reads th
 - per UTC day of the last `keepDays` days, ISO week of the last `keepWeeks` weeks and month of the last `keepMonths` months, the newest backup (a complete one first);
 - every backup whose date is unknown.
 
+Defaults (`retention.mjs`, `DEFAULT_RETENTION`): on mainnet the last 5 and one per week of the last 4 weeks, so at most about 9 backups besides the newest of each data set, protected and undated ones. On calibration: the last 2, one per day of 2 days and one per week of 1 week. `config.retention` overrides each number.
+
 With `maxBytes` the ones kept only for a day, week or month go, oldest first, until the kept ones and room for one more backup as large as the newest fit.
 
 The chain keeps no date per piece. `retain` takes them from the PDP explorer's subgraph (when each piece was added; `RETAIN_DATES_URL` overrides it) and drops a data set's dates if they go against its piece order. Without an answer, backups count as undated and stay.

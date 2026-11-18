@@ -25,7 +25,9 @@ const DAY = 24 * 60 * 60 * 1000
 
 /** What `retain` keeps when the config says nothing, per network. */
 export const DEFAULT_RETENTION = Object.freeze({
-  mainnet: Object.freeze({ keepLast: 3, keepDays: 7, keepWeeks: 4, keepMonths: 6, maxBytes: null, keepLegacy: false }),
+  // The last 5 and one per ISO week of the last 4 weeks: at most about 9
+  // backups (2026-11-18; before: last 3, 7 days, 4 weeks, 6 months, often 15–20).
+  mainnet: Object.freeze({ keepLast: 5, keepDays: 0, keepWeeks: 4, keepMonths: 0, maxBytes: null, keepLegacy: false }),
   calibration: Object.freeze({ keepLast: 2, keepDays: 2, keepWeeks: 1, keepMonths: 0, maxBytes: null, keepLegacy: false }),
 })
 

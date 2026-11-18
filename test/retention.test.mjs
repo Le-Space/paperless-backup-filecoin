@@ -35,6 +35,20 @@ describe('the policy from the config', () => {
   })
 })
 
+describe('the mainnet default', () => {
+  it('keeps the last 5 and one per week of the last 4 weeks', () => {
+    // A backup every day for 60 days, all complete, on one data set.
+    const b = history(...Array.from({ length: 60 }, (_, i) => ({ daysAgo: 59 - i })))
+    const plan = planRetention(b, retentionPolicy(undefined, 'mainnet'), { now: NOW })
+    const kept = plan.keep.map((k) => Math.round((NOW - k.date) / DAY)).sort((x, y) => x - y)
+    assert.deepEqual(kept.slice(0, 5), [0, 1, 2, 3, 4])
+    assert.ok(plan.keep.length <= 9, `kept ${plan.keep.length}`)
+    assert.ok(kept.every((d) => d <= 28), 'nothing older than the 4 weeks')
+    assert.ok(plan.keep.some((k) => k.reasons.includes('week')))
+    assert.equal(plan.keep.length + plan.remove.length, 60)
+  })
+})
+
 describe('what stays', () => {
   it('keeps the last N and removes the older ones', () => {
     const b = history({ daysAgo: 40 }, { daysAgo: 30 }, { daysAgo: 20 }, { daysAgo: 10 }, { daysAgo: 1 })
