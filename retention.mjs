@@ -23,6 +23,25 @@ import { PART_BYTES } from './parts.mjs'
 
 const DAY = 24 * 60 * 60 * 1000
 
+/**
+ * Is this the fingerprint of an empty Paperless (no documents, none in the
+ * trash)? Its backup would become the newest one, and the next start would
+ * restore an empty Paperless, so `run` and `daily` make none (2026-11-17:
+ * a Paperless that started empty did).
+ * @param {string | { documents?: unknown, trash?: unknown } | null | undefined} fingerprint JSON or parsed
+ */
+export function emptyPaperless(fingerprint) {
+  let fp = fingerprint
+  if (typeof fp === 'string') {
+    try {
+      fp = JSON.parse(fp)
+    } catch {
+      return false
+    }
+  }
+  return fp?.documents === 0 && fp?.trash === 0
+}
+
 /** What `retain` keeps when the config says nothing, per network. */
 export const DEFAULT_RETENTION = Object.freeze({
   mainnet: Object.freeze({ keepLast: 3, keepDays: 7, keepWeeks: 4, keepMonths: 6, maxBytes: null, keepLegacy: false }),
