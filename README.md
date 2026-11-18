@@ -90,7 +90,7 @@ Step-by-step setup: [HOWTO.txt](HOWTO.txt). Auf Deutsch: [ANLEITUNG.txt](ANLEITU
 | `node backup.mjs plan` | export + encrypt + decryption check, size and cost — **no upload** |
 | `node backup.mjs status` | wallet, deposit, readiness |
 | `node backup.mjs fund [months]` | deposit USDFC and approve the storage service |
-| `node backup.mjs run` | export, encrypt, upload |
+| `node backup.mjs run [--allow-empty]` | export, encrypt, upload; an empty Paperless (no documents, none in the trash) is not backed up (exit 3; `daily` skips it too), since its backup would become the newest |
 | `node backup.mjs verify` | is every copy still in its data set? |
 | `node backup.mjs list` | stored backups |
 | `node backup.mjs restore <pieceCid> [out.zip]` | download, check, decrypt (a backup in parts: by its first part's piece CID) |

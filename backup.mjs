@@ -66,7 +66,7 @@ import nodemailer from 'nodemailer'
 import { PART_BYTES, copyPieceIds, copyUrls, entryParts, isMultipart, missingParts, partHasher, partRanges, pieceFields, reassemble, uploadParts } from './parts.mjs'
 import { tryFrom as pieceFrom } from '@filoz/synapse-core/piece'
 import { dataSetLive, getActivePiecesByCursor, getScheduledRemovals } from '@filoz/synapse-core/pdp-verifier'
-import { backupsOnChain, consistentDates, describePlan, groupPieces, planRetention, removalPlan, removalsByDataSet, retentionPolicy, retirePlan } from './retention.mjs'
+import { backupsOnChain, consistentDates, describePlan, emptyPaperless, groupPieces, planRetention, removalPlan, removalsByDataSet, retentionPolicy, retirePlan } from './retention.mjs'
 import { backupMetadata, checkConfig, createRemoteSigner, dataSetState, ownDataSetsOf, parseBackupKey, payerAccount } from './remote-signer.mjs'
 import { Agent, setGlobalDispatcher } from 'undici'
 import { ByteReader, EXPORTER_ARGS, PREFIX_BYTES, classifyPrefix, dedupKeyFrom, emptyState, incrementalConfig, missingPieces, nextState, packPrefix, packStream, pieceMetadata, planSnapshot, readHeader, rebaseReason, restoreSnapshot, scanFiles, stateFromRestore } from './snapshot.mjs'
@@ -1537,10 +1537,11 @@ async function mailPreview() {
 
 const TEXT = {
   de: {
-    subject: { test: 'Paperless-Backup: Testmail', unchanged: 'Paperless-Backup: keine Änderung', done: 'Paperless-Backup: erledigt', incomplete: 'Paperless-Backup: UNVOLLSTÄNDIG', failed: 'Paperless-Backup: FEHLGESCHLAGEN' },
+    subject: { test: 'Paperless-Backup: Testmail', unchanged: 'Paperless-Backup: keine Änderung', empty: 'Paperless-Backup: Paperless ist leer, nichts gesichert', done: 'Paperless-Backup: erledigt', incomplete: 'Paperless-Backup: UNVOLLSTÄNDIG', failed: 'Paperless-Backup: FEHLGESCHLAGEN' },
     lowFunds: '⚠️ Guthaben knapp – ',
     test: 'Das ist eine Testmail des täglichen Paperless-Backups.',
     unchanged: (d) => `Keine Änderung in Paperless seit dem Backup vom ${d}. Es wurde nichts hochgeladen.`,
+    empty: 'Paperless enthält keine Dokumente (auch keine im Papierkorb). Es wurde nichts gesichert: Diese Sicherung würde die letzte echte als neueste ersetzen. Prüfe, ob das so gewollt ist.',
     uploaded: (mib, n, of) => `Neues Backup: ${mib} MiB, ${n} von ${of} Kopien gespeichert.`,
     copy: (id, country) => `Anbieter ${id} (${country})`,
     verifyOk: 'Prüfung: Jede Kopie liegt in ihrem Datensatz.',
@@ -1562,10 +1563,11 @@ const TEXT = {
     piece: 'Piece-CID',
   },
   en: {
-    subject: { test: 'Paperless backup: test mail', unchanged: 'Paperless backup: no change', done: 'Paperless backup: done', incomplete: 'Paperless backup: INCOMPLETE', failed: 'Paperless backup: FAILED' },
+    subject: { test: 'Paperless backup: test mail', unchanged: 'Paperless backup: no change', empty: 'Paperless backup: Paperless is empty, nothing backed up', done: 'Paperless backup: done', incomplete: 'Paperless backup: INCOMPLETE', failed: 'Paperless backup: FAILED' },
     lowFunds: '⚠️ Low funds – ',
     test: 'This is a test of the daily Paperless backup report.',
     unchanged: (d) => `No change in Paperless since the backup of ${d}. Nothing was uploaded.`,
+    empty: 'Paperless holds no documents (none in the trash either). Nothing was backed up: this backup would replace the last real one as the newest. Check whether that is intended.',
     uploaded: (mib, n, of) => `New backup: ${mib} MiB, ${n} of ${of} copies stored.`,
     copy: (id, country) => `provider ${id} (${country})`,
     verifyOk: 'Verify: every copy is in its data set.',
@@ -1603,6 +1605,8 @@ function renderReport(r) {
     lines.push(t.test, r.lastUpload ? t.lastBackup(when(r.lastUpload.date)) : t.noBackup)
   } else if (r.kind === 'unchanged') {
     lines.push(t.unchanged(when(r.lastUpload.date)))
+  } else if (r.kind === 'empty') {
+    lines.push(t.empty, r.lastUpload ? t.lastBackup(when(r.lastUpload.date)) : t.noBackup)
   } else if (r.kind === 'failed') {
     lines.push(t.failed(r.error), t.retry)
   } else {
@@ -1675,7 +1679,10 @@ async function daily() {
     const lastUpload = readLedger().filter((e) => e.complete && !e.deleted).at(-1)
     const stale = !lastUpload || Date.now() - Date.parse(lastUpload.date) > (config.daily?.fullEveryDays ?? 7) * DAY
     let report
-    if (fingerprint === state.lastFingerprint && !stale) {
+    if (emptyPaperless(fingerprint)) {
+      log('Paperless holds no documents: nothing uploaded (its backup would replace the newest real one)')
+      report = { kind: 'empty', lastUpload }
+    } else if (fingerprint === state.lastFingerprint && !stale) {
       log(`no change in Paperless since ${lastUpload.date}; nothing uploaded`)
       report = { kind: 'unchanged', lastUpload }
     } else {
@@ -1716,6 +1723,13 @@ const commands = {
   fund: () => fund(Number(args[0] ?? 3)),
   plan: () => (INCREMENTAL.enabled && !args.includes('--full') ? planNextSnapshot({ force: args.includes('--rebase') }) : plan()),
   run: async () => {
+    // An empty Paperless is not backed up: its backup would become the newest.
+    // Exit 3 says so (paperless-backup on the VM reports it as skipped).
+    if (!args.includes('--allow-empty') && emptyPaperless(paperlessFingerprint())) {
+      log('Paperless holds no documents (none in the trash either): no backup, it would replace the newest real one. Pass --allow-empty to back it up anyway.')
+      process.exitCode = 3
+      return
+    }
     if (!(await backupNow()).complete) process.exitCode = 2
   },
   list,

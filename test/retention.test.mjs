@@ -6,7 +6,7 @@
 import { strict as assert } from 'node:assert'
 import { describe, it } from 'node:test'
 import { PART_BYTES } from '../parts.mjs'
-import { DEFAULT_RETENTION, backupsOnChain, calendarKeys, consistentDates, describePlan, groupPieces, planRetention, removalsByDataSet, retentionPolicy } from '../retention.mjs'
+import { DEFAULT_RETENTION, backupsOnChain, emptyPaperless, calendarKeys, consistentDates, describePlan, groupPieces, planRetention, removalsByDataSet, retentionPolicy } from '../retention.mjs'
 
 const DAY = 24 * 60 * 60 * 1000
 const NOW = Date.UTC(2026, 10, 16, 12) // Mon 2026-11-16 12:00 UTC
@@ -387,5 +387,19 @@ describe('removing named pieces by hand', async () => {
     const s = sets()
     for (const ds of s) ds.pieces.push(p(9, 'pack', { snapshot: { gen: 'g', seq: 0, part: 0, parts: 1 } }))
     assert.match(removalPlan(s, { pieces: ['pack'], dataSets: all, sizeOf }).why, /snapshot pack/)
+  })
+})
+
+describe('an empty Paperless', () => {
+  it('is no documents and none in the trash', () => {
+    assert.equal(emptyPaperless({ documents: 0, trash: 0, notes: 0 }), true)
+    assert.equal(emptyPaperless(JSON.stringify({ documents: 0, trash: 0, labels: [0, 0, 0] })), true)
+  })
+  it('is not one with documents, with documents in the trash, or an unreadable fingerprint', () => {
+    assert.equal(emptyPaperless({ documents: 3, trash: 0 }), false)
+    assert.equal(emptyPaperless({ documents: 0, trash: 2 }), false)
+    assert.equal(emptyPaperless('not json'), false)
+    assert.equal(emptyPaperless(null), false)
+    assert.equal(emptyPaperless({}), false)
   })
 })
